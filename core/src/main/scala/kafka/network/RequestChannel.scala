@@ -378,10 +378,12 @@ class RequestChannel(val queueSize: Int,
       case _: StartThrottlingResponse | _: EndThrottlingResponse => ()
     }
 
+    // 找出 response 对应的 Processor 线程，即 request 当初是由哪个 Processor 线程处理，请求和响应对应的是同一个 Processor。
     val processor = processors.get(response.processor)
     // The processor may be null if it was shutdown. In this case, the connections
     // are closed, so the response is dropped.
     if (processor != null) {
+      // 将 response 对象添加到对应 Processor 线程的 response 队列中
       processor.enqueueResponse(response)
     }
   }

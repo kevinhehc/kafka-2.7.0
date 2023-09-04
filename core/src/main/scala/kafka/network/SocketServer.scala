@@ -592,40 +592,57 @@ private[kafka] class Acceptor(val endPoint: EndPoint,
    * Accept loop that checks for new connection attempts
    */
   def run(): Unit = {
+    // 向 nioSelector 注册 serverChannel 监听 serverChannel 上的 OP_ACCEPT 事件等待客户端的请求
     serverChannel.register(nioSelector, SelectionKey.OP_ACCEPT)
+    // 启动 Acceptor 线程完成，并唤醒阻塞的线程。
     startupComplete()
     try {
+      // 记录当前使用的 Processor 序号，从0开始，最大值是 num.network.threads - 1
       var currentProcessorIndex = 0
       while (isRunning) {
         try {
+          // 每隔 500 毫秒读取底层通道上准备就绪 I/O 事件的数量
           val ready = nioSelector.select(500)
+          // 如果有就绪 I/O 事件
           if (ready > 0) {
+            // 获取所有监听到的 SelectionKey 集合
             val keys = nioSelector.selectedKeys()
             val iter = keys.iterator()
+            // 遍历 SelectionKey 集合 事件
             while (iter.hasNext && isRunning) {
               try {
                 val key = iter.next
                 iter.remove()
 
+                // 这里只监听 OP_ACCEPT 事件。
                 if (key.isAcceptable) {
+                  // 调用 accept 方法处理一个新的连接请求，返回新建的 SocketChannel，
+                  // 然后轮询处理 socketChannel，即接收此连接并分配对应的 Processor 线程
                   accept(key).foreach { socketChannel =>
                     // Assign the channel to the next processor (using round-robin) to which the
                     // channel can be added without blocking. If newConnections queue is full on
                     // all processors, block until the last one is able to accept a connection.
+                    // 获取 processors 线程池的锁，保证多线程并发访问的线程安全
                     var retriesLeft = synchronized(processors.length)
                     var processor: Processor = null
                     do {
                       retriesLeft -= 1
+                      // 轮询选择哪个 Processor 线程进行处理
                       processor = synchronized {
                         // adjust the index (if necessary) and retrieve the processor atomically for
                         // correct behaviour in case the number of processors is reduced dynamically
                         currentProcessorIndex = currentProcessorIndex % processors.length
+                        // 从 Processor 线程池中取出对应的 processor 线程
                         processors(currentProcessorIndex)
                       }
+                      // 取出后更新 Processor 线程序号。
                       currentProcessorIndex += 1
+                      // 将新连接的 SocketChannel 添加到 Processor 线程等待处理连接队列，等待 Processor 线程后续处理
+                      // 这里会分配给不同的 Processor 线程，保证请求处理的负载均衡。
                     } while (!assignNewConnection(socketChannel, processor, retriesLeft == 0))
                   }
                 } else
+                // 这里只注册了 OP_ACCEPT 事件，如果是其他事件直接抛出异常。
                   throw new IllegalStateException("Unrecognized key state for acceptor thread.")
               } catch {
                 case e: Throwable => error("Error while accepting connection", e)
@@ -861,23 +878,32 @@ private[kafka] class Processor(val id: Int,
   }
 
   private def processNewResponses(): Unit = {
+    // 声明一个 response 对象
     var currentResponse: RequestChannel.Response = null
+    // 从响应队列 ResponseQueue 中取出 response
     while ({currentResponse = dequeueResponse(); currentResponse != null}) {
+      // 获取 channel_id
       val channelId = currentResponse.request.context.connectionId
       try {
+        // 匹配 response 类型，根据不同类型进行相应处理
         currentResponse match {
+          // 1、无需发送响应给客户端，比如 ack = 0
           case response: NoOpResponse =>
             // There is no response to send to the client, we need to read more pipelined requests
             // that are sitting in the server's socket buffer
+            // 更新请求相关的指标。
             updateRequestMetrics(response)
             trace(s"Socket server received empty response to send, registering for read: $response")
             // Try unmuting the channel. If there was no quota violation and the channel has not been throttled,
             // it will be unmuted immediately. If the channel has been throttled, it will be unmuted only if the
             // throttling delay has already passed by now.
+            // 无需响应客户端，所以需要读取更多的请求，先尝试解除通道的静音状态
             handleChannelMuteEvent(channelId, ChannelMuteEvent.RESPONSE_SENT)
+            // 再次绑定 OP_READ 事件
             tryUnmuteChannel(channelId)
 
           case response: SendResponse =>
+            // 真正的发送 Response 响应请求，并将其放入临时 inflightResponse 队列用来发送响应成功或响应失败后执行回调逻辑。
             sendResponse(response, response.responseSend)
           case response: CloseConnectionResponse =>
             updateRequestMetrics(response)
@@ -938,26 +964,34 @@ private[kafka] class Processor(val id: Int,
   }
 
   private def processCompletedReceives(): Unit = {
+    // 从 Selector 中提取已接收到的所有请求数据，然后遍历这些 Request 对象
     selector.completedReceives.forEach { receive =>
       try {
+        // 根据接收到的数据源(receive.source)，找到对应的 Channel 对象，保证对应连接通道已经建立了，并获取对应的 channelId。
         openOrClosingChannel(receive.source) match {
           case Some(channel) =>
+            // 获取请求头
             val header = parseRequestHeader(receive.payload)
+            // 如果接收到的请求数据为 SASL_HANDSHAKE 握手请求，且 channel 需要重新进行身份认证，则记录日志并进行后续处理。
             if (header.apiKey == ApiKeys.SASL_HANDSHAKE && channel.maybeBeginServerReauthentication(receive,
               () => time.nanoseconds()))
               trace(s"Begin re-authentication: $channel")
             else {
               val nowNanos = time.nanoseconds()
+              // 如果 channel 中的身份认证会话已过期，则关闭该 channel 的连接，并更新统计信息。
               if (channel.serverAuthenticationSessionExpired(nowNanos)) {
                 // be sure to decrease connection count and drop any in-flight responses
                 debug(s"Disconnecting expired channel: $channel : $header")
                 close(channel.id)
                 expiredConnectionsKilledCount.record(null, 1, 0)
               } else {
+                // 获取连接id
                 val connectionId = receive.source
+                // 根据请求数据创建 RequestContext 对象，进一步构造 Request 对象。
                 val context = new RequestContext(header, connectionId, channel.socketAddress,
                   channel.principal, listenerName, securityProtocol,
                   channel.channelMetadataRegistry.clientInformation)
+                // 真正构建 request 对象
                 val req = new RequestChannel.Request(processor = id, context = context,
                   startTimeNanos = nowNanos, memoryPool, receive.payload, requestChannel.metrics)
                 // KIP-511: ApiVersionsRequest is intercepted here to catch the client software name
@@ -970,7 +1004,9 @@ private[kafka] class Processor(val id: Int,
                       apiVersionsRequest.data.clientSoftwareVersion))
                   }
                 }
+                // 核心操作：将 Request 添加到 requestChannel 的 requestQueue 队列中等待处理。
                 requestChannel.sendRequest(req)
+                // 调用 selector.mute 把 OP_READ 事件移除。
                 selector.mute(connectionId)
                 handleChannelMuteEvent(connectionId, ChannelMuteEvent.REQUEST_RECEIVED)
               }
@@ -986,6 +1022,7 @@ private[kafka] class Processor(val id: Int,
           processChannelException(receive.source, s"Exception while processing request from ${receive.source}", e)
       }
     }
+    // 最后清空 Selector 中已接收的 Request。
     selector.clearCompletedReceives()
   }
 
@@ -1132,12 +1169,14 @@ private[kafka] class Processor(val id: Int,
     connId
   }
 
+  // 添加响应到 ResponseQueue 队列中，并唤醒正在等待响应的处理线程。
   private[network] def enqueueResponse(response: RequestChannel.Response): Unit = {
     responseQueue.put(response)
     wakeup()
   }
 
   private def dequeueResponse(): RequestChannel.Response = {
+    // 从 responseQueue 取出一个 response
     val response = responseQueue.poll()
     if (response != null)
       response.request.responseDequeueTimeNanos = Time.SYSTEM.nanoseconds

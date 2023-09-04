@@ -49,6 +49,7 @@ class KafkaRequestHandler(id: Int,
   @volatile private var stopped = false
 
   def run(): Unit = {
+    // 只要该线程尚未关闭就一直循环运行处理逻辑
     while (!stopped) {
       // We use a single meter for aggregate idle percentage for the thread pool.
       // Since meter is calculated as total_recorded_value / time_window and
@@ -56,21 +57,26 @@ class KafkaRequestHandler(id: Int,
       // time should be discounted by # threads.
       val startSelectTime = time.nanoseconds
 
+      // 每隔300ms从请求队列中获取下一个待处理的请求
       val req = requestChannel.receiveRequest(300)
       val endTime = time.nanoseconds
       val idleTime = endTime - startSelectTime
       aggregateIdleMeter.mark(idleTime / totalHandlerThreads.get)
 
+      // 匹配 request 类型，分情况处理
       req match {
+        // 关闭线程请求
         case RequestChannel.ShutdownRequest =>
           debug(s"Kafka request handler $id on broker $brokerId received shut down command")
           shutdownComplete.countDown()
           return
 
+        // 普通请求
         case request: RequestChannel.Request =>
           try {
             request.requestDequeueTimeNanos = endTime
             trace(s"Kafka request handler $id on broker $brokerId handling request $request")
+            // 调用 KafkaApis.handle 方法对 Request对象执行相应处理逻辑
             apis.handle(request)
           } catch {
             case e: FatalExitError =>
@@ -78,12 +84,14 @@ class KafkaRequestHandler(id: Int,
               Exit.exit(e.statusCode)
             case e: Throwable => error("Exception when handling request", e)
           } finally {
+            // 释放请求对象占用的内存缓冲区资源
             request.releaseBuffer()
           }
 
         case null => // continue
       }
     }
+    // 如果 stopped = true，即关闭状态，则关闭线程
     shutdownComplete.countDown()
   }
 
