@@ -261,6 +261,7 @@ class KafkaServer(val config: KafkaConfig, time: Time = Time.SYSTEM, threadNameP
         config.dynamicConfig.initialize(zkClient)
 
         /* start scheduler */
+        // 初始化一个线程池用于处理后台工作，该线程池的前缀为 kafka-scheduler-,具体工作线程为KafkaThread
         kafkaScheduler = new KafkaScheduler(config.backgroundThreads)
         kafkaScheduler.startup()
 
@@ -287,7 +288,10 @@ class KafkaServer(val config: KafkaConfig, time: Time = Time.SYSTEM, threadNameP
         logDirFailureChannel = new LogDirFailureChannel(config.logDirs.size)
 
         /* start log manager */
+        // 初始化 LogManager 对象，参数包括配置项、已下线的分区、ZooKeeper客户端、
+        // 当前的Broker状态、调度器、时间对象、Broker主题状态和日志目录错误处理器
         logManager = LogManager(config, initialOfflineDirs, zkClient, brokerState, kafkaScheduler, time, brokerTopicStats, logDirFailureChannel)
+        // 启动 LogManager 日志管理模块
         logManager.startup()
 
         metadataCache = new MetadataCache(config.brokerId)
@@ -396,6 +400,7 @@ class KafkaServer(val config: KafkaConfig, time: Time = Time.SYSTEM, threadNameP
     }
     catch {
       case e: Throwable =>
+        // 打印异常日志，标记状态变量
         fatal("Fatal error during KafkaServer startup. Prepare to shutdown", e)
         isStartingUp.set(false)
         shutdown()

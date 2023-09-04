@@ -607,28 +607,38 @@ class ReplicaManager(val config: KafkaConfig,
    * are expected to call ActionQueue.tryCompleteActions for all affected partitions, without holding any conflicting
    * locks.
    */
-  def appendRecords(timeout: Long,
-                    requiredAcks: Short,
-                    internalTopicsAllowed: Boolean,
-                    origin: AppendOrigin,
-                    entriesPerPartition: Map[TopicPartition, MemoryRecords],
-                    responseCallback: Map[TopicPartition, PartitionResponse] => Unit,
-                    delayedProduceLock: Option[Lock] = None,
+  // 追加日志消息
+  def appendRecords(timeout: Long, // 请求处理超时时间。对于生产者来说，它就是 request.timeout.ms 参数值。
+                    requiredAcks: Short,  // 是否需要等待其他副本写入。对于生产者来说，它就是 acks 参数的值。
+                    internalTopicsAllowed: Boolean, // 是否允许向内部主题写入消息。对于普通的生产者而言，该字段是 false，
+                                                    // 即不允许写入内部主题。而对于 Coordinator 组件，
+                                                    // 特别是消费者组 GroupCoordinator 组件来说，
+                                                    // 它的职责之一就是向内部位移主题写入消息，此时该字段值是 true。
+                    origin: AppendOrigin, // 是一个接口，表示写入方来源。当前，它定义了3类写入方，分别是Replication、Coordinator和Client
+                    entriesPerPartition: Map[TopicPartition, MemoryRecords], // 按照分区分组的实际要写入的消息二元组集合
+                    responseCallback: Map[TopicPartition, PartitionResponse] => Unit, // 写入成功后的回调方法
+                    delayedProduceLock: Option[Lock] = None, // 专门用来保护消费者组操作线程安全的锁对象
                     recordConversionStatsCallback: Map[TopicPartition, RecordConversionStats] => Unit = _ => ()): Unit = {
+    // 校验 ack 合法值，如果非法直接返回错误响应
     if (isValidRequiredAcks(requiredAcks)) {
       val sTime = time.milliseconds
+      // 调用 appendToLocalLog 方法写入消息到本地日志文件中，返回写入结果
       val localProduceResults = appendToLocalLog(internalTopicsAllowed = internalTopicsAllowed,
         origin, entriesPerPartition, requiredAcks)
       debug("Produce to local log in %d ms".format(time.milliseconds - sTime))
 
+      // 根据写日志返回的结果，封装返回给客户端的响应结果。
       val produceStatus = localProduceResults.map { case (topicPartition, result) =>
         topicPartition ->
                 ProducePartitionStatus(
+                  // 计算出下一条待写入消息的位移值
                   result.info.lastOffset + 1, // required offset
+                  // 构建 PartitionResponse 封装写入结果
                   new PartitionResponse(result.error, result.info.firstOffset.getOrElse(-1), result.info.logAppendTime,
                     result.info.logStartOffset, result.info.recordErrors.asJava, result.info.errorMessage)) // response status
       }
 
+      // 尝试触发操作
       actionQueue.add {
         () =>
           localProduceResults.foreach {
@@ -637,45 +647,59 @@ class ReplicaManager(val config: KafkaConfig,
               result.info.leaderHwChange match {
                 case LeaderHwChange.Increased =>
                   // some delayed operations may be unblocked after HW changed
+                  // 一些延迟操作或许因为 HW 更改而被解除阻塞
                   delayedProducePurgatory.checkAndComplete(requestKey)
                   delayedFetchPurgatory.checkAndComplete(requestKey)
                   delayedDeleteRecordsPurgatory.checkAndComplete(requestKey)
                 case LeaderHwChange.Same =>
+                  // 一些跟随者获取请求可能会因为日志末尾偏移量更新而解除阻塞
                   // probably unblock some follower fetch requests since log end offset has been updated
                   delayedFetchPurgatory.checkAndComplete(requestKey)
                 case LeaderHwChange.None =>
+                // 什么也不做
                   // nothing
               }
           }
       }
 
+      // 尝试更新消息格式转换的指标数据
       recordConversionStatsCallback(localProduceResults.map { case (k, v) => k -> v.info.recordConversionStats })
 
+      // 根据 acks 的值，判断是否需要延迟响应客户端。通常当 acks = -1 时，
+      // 需要通知其他 replica 复制消息，保证复制完了才会响应客户端，这时候就需要使用延迟操作，并构建对应的 DelayedProduce 对象
       if (delayedProduceRequestRequired(requiredAcks, entriesPerPartition, localProduceResults)) {
         // create delayed produce operation
+        // 构造 ProduceMetadata 对象，记录要写入的消息状态
         val produceMetadata = ProduceMetadata(requiredAcks, produceStatus)
+        // 构造 DelayedProduce 延迟请求对象，对写入结果进行异步等待。超过timeout时间后这个操作会被认定为超时，并立刻返回，发送响应给客户端。
         val delayedProduce = new DelayedProduce(timeout, produceMetadata, this, responseCallback, delayedProduceLock)
 
         // create a list of (topic, partition) pairs to use as keys for this delayed produce operation
+        // 构建一个由 (topic, partition) 对列表，用来作为 DelayedProduce 延时请求对象的 key，然后遍历有哪些 topic 需要检查延迟操作是否完成。
         val producerRequestKeys = entriesPerPartition.keys.map(TopicPartitionOperationKey(_)).toSeq
 
         // try to complete the request immediately, otherwise put it into the purgatory
         // this is because while the delayed produce operation is being created, new
         // requests may arrive and hence make this operation completable.
+        // 尝试立即响应请求，否则将其压入 Purgatory 中等待唤醒后处理
         delayedProducePurgatory.tryCompleteElseWatch(delayedProduce, producerRequestKeys)
 
       } else {
         // we can respond immediately
+        // 不需要等待响应立刻发送响应给客户端，直接将 produceStatus 转换成 response 内存块返回接收到的请求线程
         val produceResponseStatus = produceStatus.map { case (k, status) => k -> status.responseStatus }
+        // 调用回调方法
         responseCallback(produceResponseStatus)
       }
     } else {
       // If required.acks is outside accepted range, something is wrong with the client
       // Just return an error and don't handle the request at all
+      // 如果 required.acks 的值非法，说明客户端使用异常，直接返回错误响应
       val responseStatus = entriesPerPartition.map { case (topicPartition, _) =>
         topicPartition -> new PartitionResponse(Errors.INVALID_REQUIRED_ACKS,
           LogAppendInfo.UnknownLogAppendInfo.firstOffset.getOrElse(-1), RecordBatch.NO_TIMESTAMP, LogAppendInfo.UnknownLogAppendInfo.logStartOffset)
       }
+      // 调用回调方法
       responseCallback(responseStatus)
     }
   }
@@ -918,11 +942,13 @@ class ReplicaManager(val config: KafkaConfig,
   /**
    * Append the messages to the local replica logs
    */
-  private def appendToLocalLog(internalTopicsAllowed: Boolean,
-                               origin: AppendOrigin,
-                               entriesPerPartition: Map[TopicPartition, MemoryRecords],
+  // 将消息追加到本地 Leader 副本的日志中
+  private def appendToLocalLog(internalTopicsAllowed: Boolean, // 是否允许写入内部主题
+                               origin: AppendOrigin, // 写入来源
+                               entriesPerPartition: Map[TopicPartition, MemoryRecords], // 按照分区分组的实际要写入的消息二元组集合
                                requiredAcks: Short): Map[TopicPartition, LogAppendResult] = {
     val traceEnabled = isTraceEnabled
+    // 当追加日志操作失败，则记录日志、发送统计数据，并返回产生错误的分区的起始偏移量
     def processFailedRecord(topicPartition: TopicPartition, t: Throwable) = {
       val logStartOffset = getPartition(topicPartition) match {
         case HostedPartition.Online(partition) => partition.logStartOffset
@@ -938,22 +964,32 @@ class ReplicaManager(val config: KafkaConfig,
     if (traceEnabled)
       trace(s"Append [$entriesPerPartition] to local log")
 
+    // 遍历 entriesPerPartition 分区中的每个分区对应的消息数据 (topicPartition, records) 对象，然后一个个分区写消息集合。
     entriesPerPartition.map { case (topicPartition, records) =>
+      // 统计请求的产生总量、失败总量
       brokerTopicStats.topicStats(topicPartition.topic).totalProduceRequestRate.mark()
       brokerTopicStats.allTopicsStats.totalProduceRequestRate.mark()
 
       // reject appending to internal topics if it is not allowed
+      // 如果当前分区 topicPartition 是系统内部主题 __consumer_offsets，且在配置中被设置不允许追加操作，则追加操作被拒绝
+      // 内部主题是：topic:__consumer_offsets 和 __transaction_state
       if (Topic.isInternal(topicPartition.topic) && !internalTopicsAllowed) {
         (topicPartition, LogAppendResult(
           LogAppendInfo.UnknownLogAppendInfo,
+          // 直接返回客户端错误信息
           Some(new InvalidTopicException(s"Cannot append to internal topic ${topicPartition.topic}"))))
       } else {
+        // 正常业务的 topic 执行逻辑
         try {
+          // 获取 topicPartition 对应的日志分区对象 partition
           val partition = getPartitionOrException(topicPartition)
+          // 调用 partition 类的方法向 Leader 分区对象写入消息集合
           val info = partition.appendRecordsToLeader(records, origin, requiredAcks)
+          // 计算写入的消息数量
           val numAppendedMessages = info.numMessages
 
           // update stats for successfully appended bytes and messages as bytesInRate and messageInRate
+          // 根据追加的数据计算更新部分统计信息，例如每秒追加的字节数 bytesInRate、每秒追加的消息总量 messagesInRate。
           brokerTopicStats.topicStats(topicPartition.topic).bytesInRate.mark(records.sizeInBytes)
           brokerTopicStats.allTopicsStats.bytesInRate.mark(records.sizeInBytes)
           brokerTopicStats.topicStats(topicPartition.topic).messagesInRate.mark(numAppendedMessages)
@@ -963,10 +999,13 @@ class ReplicaManager(val config: KafkaConfig,
             trace(s"${records.sizeInBytes} written to log $topicPartition beginning at offset " +
               s"${info.firstOffset.getOrElse(-1)} and ending at offset ${info.lastOffset}")
 
+          // 返回封装追加结果 LogAppendResult 对象
           (topicPartition, LogAppendResult(info))
         } catch {
           // NOTE: Failed produce requests metric is not incremented for known exceptions
           // it is supposed to indicate un-expected failures of a broker in handling a produce request
+          // 处理已知异常，例如未找到分区、非 Leader 副本、记录过大、批次条目过大、记录校验失败、记录数据损坏等异常，
+          // 一旦追加失败，将为异常记录统计数据、打印日志，并返回相应的 LogAppendResult 对象
           case e@ (_: UnknownTopicOrPartitionException |
                    _: NotLeaderOrFollowerException |
                    _: RecordTooLargeException |
@@ -1010,28 +1049,47 @@ class ReplicaManager(val config: KafkaConfig,
    * the callback function will be triggered either when timeout or required fetch info is satisfied.
    * Consumers may fetch from any replica, but followers can only fetch from the leader.
    */
-  def fetchMessages(timeout: Long,
-                    replicaId: Int,
-                    fetchMinBytes: Int,
-                    fetchMaxBytes: Int,
-                    hardMaxBytesLimit: Boolean,
-                    fetchInfos: Seq[(TopicPartition, PartitionData)],
-                    quota: ReplicaQuota,
-                    responseCallback: Seq[(TopicPartition, FetchPartitionData)] => Unit,
-                    isolationLevel: IsolationLevel,
-                    clientMetadata: Option[ClientMetadata]): Unit = {
+  // Broker 端接收到该请求后，调用 fetchMessages 方法从底层的 Leader 副本取出消息。
+  // 需要等待足够的数据被获取后返回，回调函数将在超时或满足所需的拉取信息时触发。
+  // 消费者可以从任何副本中拉取消息，但 follower 者只能从 Leader 拉取。
+  def fetchMessages(timeout: Long, // 拉取处理超时时间，对于消费者而言，该值就是 request.timeout.ms 参数值。
+                    // 对于 Follower 副本而言，该值是 Broker 端参数 replica.fetch.wait.max.ms 的值。
+                    replicaId: Int, // 副本ID。对于消费者而言，该参数值是-1；对于 Follower 副本而言，该值就是 Follower 副本所在的Broker ID。
+                    fetchMinBytes: Int, // 能够拉取请求的最小字节数。对于消费者而言，对应于 Consumer 端参数 fetch.min.bytes 值；
+                    // 对于 Follower 副本而言，对应于 Broker 端参数replica.fetch.min.bytes 值。
+                    fetchMaxBytes: Int, // 能够拉取请求的最大字节数。对于消费者而言，对应于 Consumer 端参数 fetch.max.bytes 值；
+                    // 对于 Follower 副本而言，对应于 Broker 端参数replica.fetch.max.bytes 值。
+                    hardMaxBytesLimit: Boolean, // 是否严格限制 fetchMaxBytes。
+                    fetchInfos: Seq[(TopicPartition, PartitionData)], // 拉取请求的详细信息
+                    // （包括拉取哪些 Partition、从这些分区的哪个起始偏移量开始读、最大可以拉取多少字节数等）。
+                    quota: ReplicaQuota,  // 配额控制类，主要是为了判断是否需要在读取的过程中做限速控制
+                    responseCallback: Seq[(TopicPartition, FetchPartitionData)] => Unit,// 回调逻辑函数，当请求被处理完成后，调用该方法执行收尾逻辑。
+                    isolationLevel: IsolationLevel, // 用于设置消息读取的事务隔离级别。
+                    clientMetadata: Option[ClientMetadata]): Unit = { // 用于判断消息拉取是基于消费端还是基于 Leader 端。
+    // 判断该读取请求是否来自于 Follower 副本或 Consumer
     val isFromFollower = Request.isValidBrokerId(replicaId)
     val isFromConsumer = !(isFromFollower || replicaId == Request.FutureLocalReplicaId)
+    // fetchIsolation 即读取隔离级别，根据请求发送方判断可读取范围
     val fetchIsolation = if (!isFromConsumer)
       FetchLogEnd
+
+    // 如果请求来自于Follower副本，那么可以读到LEO值，即从分区最大的 Offset 开始拉取
     else if (isolationLevel == IsolationLevel.READ_COMMITTED)
       FetchTxnCommitted
+
+    // 如果请求是普通消费者,且来自于配置了READ_COMMITTED的消费者，那么可以读到Log Stable Offset值，即从已提交的事务开始拉取
     else
+    // 其他消费者，那么可以读到高水位值前的消息
       FetchHighWatermark
 
     // Restrict fetching to leader if request is from follower or from a client with older version (no ClientMetadata)
+    // 如果是从节点或者消息客户端版本太老，就限制只能从 Leader 获取数据（fetchOnlyFromLeader），
+    // 否则可以从任意节点拉取消息数据，读取的过程中会记录剩余配额和统计 Kafka 服务器的相关指标。
     val fetchOnlyFromLeader = isFromFollower || (isFromConsumer && clientMetadata.isEmpty)
+
+    // 定义读取本地日志中的消息的方法。
     def readFromLog(): Seq[(TopicPartition, LogReadResult)] = {
+      // 从本地副本中读取指定 Partition 的消息数据
       val result = readFromLocalLog(
         replicaId = replicaId,
         fetchOnlyFromLeader = fetchOnlyFromLeader,
@@ -1041,12 +1099,17 @@ class ReplicaManager(val config: KafkaConfig,
         readPartitionInfo = fetchInfos,
         quota = quota,
         clientMetadata = clientMetadata)
+
+      // 如果拉取方是 follower 副本节点，则可能需要更新分区的高水位
       if (isFromFollower) updateFollowerFetchState(replicaId, result)
+      // 否则直接返回读取结果。
       else result
     }
 
+    // 调用读取本地日志的方法，并返回读取日志的结果。
+    // logReadResults 是 Seq[(TopicPartition, LogReadResult)]
     val logReadResults = readFromLog()
-
+    // 对读取结果进行一些统计，如统计不同 Topic 的拉取速度，记录已读取的字节数等。
     // check if this fetch request can be satisfied right away
     var bytesReadable: Long = 0
     var errorReadingData = false
@@ -1069,6 +1132,16 @@ class ReplicaManager(val config: KafkaConfig,
     //                        3) has enough data to respond
     //                        4) some error happens while reading data
     //                        5) we found a diverging epoch
+
+    // 4、根据读取日志的结果，判断是否要立即返回给客户端
+    //  如果符合以下任一条件：
+    //      1）不需要等待即 fetch 请求未设置等待时间；
+    //      2）fetch 请求内容为空；
+    //      3）已经读取到的数据量达到了 fetchMinBytes 即读取数据量满足 fetch 请求 ；
+    //      4）在读取数据时出现了错误；
+    //      5）发现了新的  LeaderEpoch 时，那么就立即将拉取到的消息数据封装成 FetchPartitionData 对象，
+    //      并回调 responseCallback 函数返回给消费方。否则，构建一个延迟拉取对象 delayedFetch，
+    //      将拉取请求暂时放到等待队列中，等待符合上述任一条件时再将消息数据返回给消费方。
     if (timeout <= 0 || fetchInfos.isEmpty || bytesReadable >= fetchMinBytes || errorReadingData || hasDivergingEpoch) {
       val fetchPartitionData = logReadResults.map { case (tp, result) =>
         val isReassignmentFetch = isFromFollower && isAddingReplica(tp, replicaId)
@@ -1083,9 +1156,14 @@ class ReplicaManager(val config: KafkaConfig,
           result.preferredReadReplica,
           isReassignmentFetch)
       }
+      // 执行回调
       responseCallback(fetchPartitionData)
     } else {
       // construct the fetch results from the read results
+      // 如果无法立即完成请求,就要延迟处理了
+      // construct the fetch results from the read results
+      // 构建 fetchPartitionStatus 数据结构，并将每个 Partition 的起始偏移量等信息和 PartitionData 数据结构一起打包
+      // （例如 topic，partition，maxBytes 等），存储在 SFetchMetadata 中。
       val fetchPartitionStatus = new mutable.ArrayBuffer[(TopicPartition, FetchPartitionStatus)]
       fetchInfos.foreach { case (topicPartition, partitionData) =>
         logReadResultMap.get(topicPartition).foreach(logReadResult => {
@@ -1099,6 +1177,8 @@ class ReplicaManager(val config: KafkaConfig,
         responseCallback)
 
       // create a list of (topic, partition) pairs to use as keys for this delayed fetch operation
+      // 构建一组 Topic / Partition 键值对，用于在延迟拉取队列中暂存该拉取请求。如果此时还能够满足消费端的拉取请求，则会直接返回数据；
+      // 否则，会将请求进一步延迟，直到能够获取到符合条件的消息数据后才会返回给消费端。
       val delayedFetchKeys = fetchPartitionStatus.map { case (tp, _) => TopicPartitionOperationKey(tp) }
 
       // try to complete the request immediately, otherwise put it into the purgatory;
@@ -1111,41 +1191,58 @@ class ReplicaManager(val config: KafkaConfig,
   /**
    * Read from multiple topic partitions at the given offset up to maxSize bytes
    */
-  def readFromLocalLog(replicaId: Int,
-                       fetchOnlyFromLeader: Boolean,
-                       fetchIsolation: FetchIsolation,
-                       fetchMaxBytes: Int,
+  //  用给定分区的 offset，从多个主题分区读取消息，直到消息的大小满足设定的最大的值 maxSize。
+  def readFromLocalLog(replicaId: Int, // 要读取的replicaId。
+                       fetchOnlyFromLeader: Boolean, // 是否只从 leader 分区读取。
+                       fetchIsolation: FetchIsolation, // 获取隔离级别
+                       fetchMaxBytes: Int, // 获取消息的大小
                        hardMaxBytesLimit: Boolean,
-                       readPartitionInfo: Seq[(TopicPartition, PartitionData)],
+                       readPartitionInfo: Seq[(TopicPartition, PartitionData)], //读哪些分区，从哪个offset开始读取
                        quota: ReplicaQuota,
                        clientMetadata: Option[ClientMetadata]): Seq[(TopicPartition, LogReadResult)] = {
     val traceEnabled = isTraceEnabled
 
+    // 真正负责读取的内部方法，每个分区的读取逻辑, read 方法，核心是调用 partition.readRecords 拉取消息
+    // tp  拉取消息TopicPartition信息
+    // fetchInfo  拉取消息的元数据信息（与tp相对应）
+    // limitBytes 拉取消息的最大值
+    // minOneMessage 对能否超过最大字节数做硬限制
     def read(tp: TopicPartition, fetchInfo: PartitionData, limitBytes: Int, minOneMessage: Boolean): LogReadResult = {
+      //  获取要获取消息的关键参数
       val offset = fetchInfo.fetchOffset
+      // 读取的分区偏移量
       val partitionFetchSize = fetchInfo.maxBytes
+      // 该次读取的最大字节数
       val followerLogStartOffset = fetchInfo.logStartOffset
-
+      // follower 的起始偏移量 LSO
+      // limitBytes值：Math.min(Math.min(fetchRequest.maxBytes, config.fetchMaxBytes), maxQuotaWindowBytes)
       val adjustedMaxBytes = math.min(fetchInfo.maxBytes, limitBytes)
+      // 最大字节数，和传入的最大字节数、该次读取的最大字节数取最小值
       try {
+        // 如果日志跟踪可用
         if (traceEnabled)
           trace(s"Fetching log segment for partition $tp, offset $offset, partition fetch size $partitionFetchSize, " +
             s"remaining response limit $limitBytes" +
+            // 输出日志
             (if (minOneMessage) s", ignoring response/partition size limits" else ""))
 
+        // 根据 tp 获取 partition 信息即从 broker 的所有分区中找到与传入的分区相匹配的分区
         val partition = getPartitionOrException(tp)
         val fetchTimeMs = time.milliseconds
 
         // If we are the leader, determine the preferred read-replica
+        // 判断哪个副本是首选副本。kafka 从 2.4 版本开始支持从读取效果最好的分区（也包括follower）读取消息，这样能提升读取效率。
         val preferredReadReplica = clientMetadata.flatMap(
           metadata => findPreferredReadReplica(partition, metadata, replicaId, fetchInfo.fetchOffset, fetchTimeMs))
 
+        // 如果已经有首选副本了，则直接返回该副本的信息
         if (preferredReadReplica.isDefined) {
           replicaSelectorOpt.foreach { selector =>
             debug(s"Replica selector ${selector.getClass.getSimpleName} returned preferred replica " +
               s"${preferredReadReplica.get} for $clientMetadata")
           }
           // If a preferred read-replica is set, skip the read
+          // 如果有首选副本，则直接返回信息
           val offsetSnapshot = partition.fetchOffsetSnapshot(fetchInfo.currentLeaderEpoch, fetchOnlyFromLeader = false)
           LogReadResult(info = FetchDataInfo(LogOffsetMetadata.UnknownOffsetMetadata, MemoryRecords.EMPTY),
             divergingEpoch = None,
@@ -1159,6 +1256,7 @@ class ReplicaManager(val config: KafkaConfig,
             exception = None)
         } else {
           // Try the read first, this tells us whether we need all of adjustedFetchSize for this partition
+          // 如果没有首选副本，则从分区中读取本地消息数据。
           val readInfo: LogReadInfo = partition.readRecords(
             lastFetchedEpoch = fetchInfo.lastFetchedEpoch,
             fetchOffset = fetchInfo.fetchOffset,
@@ -1168,17 +1266,21 @@ class ReplicaManager(val config: KafkaConfig,
             fetchOnlyFromLeader = fetchOnlyFromLeader,
             minOneMessage = minOneMessage)
 
+          // 根据分区的限制信息，修正读取到的数据
           val fetchDataInfo = if (shouldLeaderThrottle(quota, partition, replicaId)) {
             // If the partition is being throttled, simply return an empty set.
+            // 如果分区达到了限制，直接返回空
             FetchDataInfo(readInfo.fetchedData.fetchOffsetMetadata, MemoryRecords.EMPTY)
           } else if (!hardMaxBytesLimit && readInfo.fetchedData.firstEntryIncomplete) {
             // For FetchRequest version 3, we replace incomplete message sets with an empty one as consumers can make
             // progress in such cases and don't need to report a `RecordTooLargeException`
+            // 如果读取的消息是不完整的，将其设为 empty
             FetchDataInfo(readInfo.fetchedData.fetchOffsetMetadata, MemoryRecords.EMPTY)
           } else {
             readInfo.fetchedData
           }
 
+          // 构建日志读取结构，返回读取结果
           LogReadResult(info = fetchDataInfo,
             divergingEpoch = readInfo.divergingEpoch,
             highWatermark = readInfo.highWatermark,
@@ -1193,6 +1295,9 @@ class ReplicaManager(val config: KafkaConfig,
       } catch {
         // NOTE: Failed fetch requests metric is not incremented for known exceptions since it
         // is supposed to indicate un-expected failure of a broker in handling a fetch request
+        // 处理各种异常
+        // 一些异常是预期之内的，不应该计入“失败的抓取请求计数指标”
+        // 比如 UnknownTopicOrPartitionException、NotLeaderOrFollowerException、UnknownLeaderEpochException 等
         case e@ (_: UnknownTopicOrPartitionException |
                  _: NotLeaderOrFollowerException |
                  _: UnknownLeaderEpochException |
@@ -1200,6 +1305,7 @@ class ReplicaManager(val config: KafkaConfig,
                  _: ReplicaNotAvailableException |
                  _: KafkaStorageException |
                  _: OffsetOutOfRangeException) =>
+          // 处理异常时的行为，返回错误信息
           LogReadResult(info = FetchDataInfo(LogOffsetMetadata.UnknownOffsetMetadata, MemoryRecords.EMPTY),
             divergingEpoch = None,
             highWatermark = Log.UnknownOffset,
@@ -1229,14 +1335,22 @@ class ReplicaManager(val config: KafkaConfig,
       }
     }
 
+    // 设定当前的最大读取字节数
     var limitBytes = fetchMaxBytes
+    // topic-partation类型的数组
     val result = new mutable.ArrayBuffer[(TopicPartition, LogReadResult)]
+    // 是否至少读取一个 message，初始化为 true
     var minOneMessage = !hardMaxBytesLimit
+    // 在待读取分区上循环调用其日志对象的 read 方法执行实际的消息读取
+    // readPartitionInfo 来自消费者，读取分区的信息
     readPartitionInfo.foreach { case (tp, fetchInfo) =>
+      // 遍历 TopicPartition，并进行数据读取
       val readResult = read(tp, fetchInfo, limitBytes, minOneMessage)
+      // 读取分区数据
       val recordBatchSize = readResult.info.records.sizeInBytes
       // Once we read from a non-empty partition, we stop ignoring request and partition level size limits
       if (recordBatchSize > 0)
+      // 如果分区返回了数据，则将 minOneMessage 设为 false，不再忽略限制
         minOneMessage = false
       limitBytes = math.max(0, limitBytes - recordBatchSize)
       result += (tp -> readResult)

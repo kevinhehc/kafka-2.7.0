@@ -1063,22 +1063,29 @@ class Partition(val topicPartition: TopicPartition,
   }
 
   def appendRecordsToLeader(records: MemoryRecords, origin: AppendOrigin, requiredAcks: Int): LogAppendInfo = {
+    // 读锁
     val (info, leaderHWIncremented) = inReadLock(leaderIsrUpdateLock) {
+      // 写之前先判断该 replica 是否是 Leader，如果不是 Leader 则没有写权限
       leaderLogIfLocal match {
         case Some(leaderLog) =>
+          // 最小 isr 同步副本集合
           val minIsr = leaderLog.config.minInSyncReplicas
+          // 当前 isr 同步副本集合数
           val inSyncSize = isrState.isr.size
 
           // Avoid writing to leader if there are not enough insync replicas to make it safe
+          // 如果请求的 acks = -1，但是当前的 ISR 比配置的 minInSyncReplicas 还小，那要抛出错误，表示当前 ISR 不足。
           if (inSyncSize < minIsr && requiredAcks == -1) {
             throw new NotEnoughReplicasException(s"The size of the current ISR ${isrState.isr} " +
               s"is insufficient to satisfy the min.isr requirement of $minIsr for partition $topicPartition")
           }
 
+          // 消息通过 log 对象写入磁盘
           val info = leaderLog.appendAsLeader(records, leaderEpoch = this.leaderEpoch, origin,
             interBrokerProtocolVersion)
 
           // we may need to increment high watermark since ISR could be down to 1
+          // 变更该分区的高水位
           (info, maybeIncrementLeaderHW(leaderLog))
 
         case None =>
@@ -1090,35 +1097,49 @@ class Partition(val topicPartition: TopicPartition,
     info.copy(leaderHwChange = if (leaderHWIncremented) LeaderHwChange.Increased else LeaderHwChange.Same)
   }
 
-  def readRecords(lastFetchedEpoch: Optional[Integer],
-                  fetchOffset: Long,
-                  currentLeaderEpoch: Optional[Integer],
-                  maxBytes: Int,
-                  fetchIsolation: FetchIsolation,
-                  fetchOnlyFromLeader: Boolean,
+  def readRecords(lastFetchedEpoch: Optional[Integer], // 上一次获取的 epoch
+                  fetchOffset: Long, //  获取记录时的偏移量
+                  currentLeaderEpoch: Optional[Integer], // 当前 leader epoch
+                  maxBytes: Int, //  最大获取字节数
+                  fetchIsolation: FetchIsolation, // 消息隔离级别（读取未提交消息或全部消息）
+                  fetchOnlyFromLeader: Boolean, // 是否只从 leader 读取
+                  // 是否至少获取一条消息      // 这里通过读锁来读取
                   minOneMessage: Boolean): LogReadInfo = inReadLock(leaderIsrUpdateLock) {
     // decide whether to only fetch from leader
+    // 选择是否只从 leader 获取数据
     val localLog = localLogWithEpochOrException(currentLeaderEpoch, fetchOnlyFromLeader)
 
     // Note we use the log end offset prior to the read. This ensures that any appends following
     // the fetch do not prevent a follower from coming into sync.
+    // 初始化位移值，注意，我们在读取记录之前使用日志结束偏移量 LEO。这将确保随后的追加操作不会阻止追随者同步。
+
+    // 获取本地记录的 high watermark
     val initialHighWatermark = localLog.highWatermark
+    // 获取本地记录的起始偏移量
     val initialLogStartOffset = localLog.logStartOffset
+    // 获取本地记录的结束偏移量
     val initialLogEndOffset = localLog.logEndOffset
+    // 获取本地记录的最后稳定偏移量，这里主要用于事务消息
     val initialLastStableOffset = localLog.lastStableOffset
 
+    // lastFetchedEpoch 表示上一次同步条目的 epoch，如果指定了 lastFetchedEpoch，则查询该 epoch 的最后一个偏移量
     lastFetchedEpoch.ifPresent { fetchEpoch =>
+      // 获取该 epoch 的最后一个偏移量信息
       val epochEndOffset = lastOffsetForLeaderEpoch(currentLeaderEpoch, fetchEpoch, fetchOnlyFromLeader = false)
+      // 如果有错误，则抛出异常
       if (epochEndOffset.error != Errors.NONE) {
         throw epochEndOffset.error.exception()
       }
 
+      // 如果最后一个偏移量未定义，则抛出 OffsetOutOfRangeException 异常
       if (epochEndOffset.hasUndefinedEpochOrOffset) {
         throw new OffsetOutOfRangeException("Could not determine the end offset of the last fetched epoch " +
           s"$lastFetchedEpoch from the request")
       }
 
+      // 如果返回的 leader epoch 小于 fetchEpoch 或者返回的偏移量小于 fetchOffset，则返回空记录
       if (epochEndOffset.leaderEpoch < fetchEpoch || epochEndOffset.endOffset < fetchOffset) {
+        // 定义空记录数据结构
         val emptyFetchData = FetchDataInfo(
           fetchOffsetMetadata = LogOffsetMetadata(fetchOffset),
           records = MemoryRecords.EMPTY,
@@ -1126,10 +1147,12 @@ class Partition(val topicPartition: TopicPartition,
           abortedTransactions = None
         )
 
+        // 生成分界点信息
         val divergingEpoch = new FetchResponseData.EpochEndOffset()
           .setEpoch(epochEndOffset.leaderEpoch)
           .setEndOffset(epochEndOffset.endOffset)
 
+        // 返回 LogReadInfo，包含空记录和分界点信息等
         return LogReadInfo(
           fetchedData = emptyFetchData,
           divergingEpoch = Some(divergingEpoch),
@@ -1140,7 +1163,10 @@ class Partition(val topicPartition: TopicPartition,
       }
     }
 
+    // 读取 Log 日志消息
     val fetchedData = localLog.read(fetchOffset, maxBytes, fetchIsolation, minOneMessage)
+
+    // 返回 LogReadInfo，包含已读记录和位移值信息等
     LogReadInfo(
       fetchedData = fetchedData,
       divergingEpoch = None,

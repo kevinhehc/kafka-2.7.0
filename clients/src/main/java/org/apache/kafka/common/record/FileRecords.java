@@ -136,19 +136,23 @@ public class FileRecords extends AbstractRecords implements Closeable {
      */
     public FileRecords slice(int position, int size) throws IOException {
         // Cache current size in case concurrent write changes it
+        // 缓存当前文件记录大小以防并发写入改变它
         int currentSizeInBytes = sizeInBytes();
 
         if (position < 0)
             throw new IllegalArgumentException("Invalid position: " + position + " in read from " + this);
         if (position > currentSizeInBytes - start)
+            // position必须不小于0，且不能大于存储文件记录的大小。
             throw new IllegalArgumentException("Slice from position " + position + " exceeds end position of " + this);
         if (size < 0)
             throw new IllegalArgumentException("Invalid size: " + size + " in read from " + this);
 
+        // 如果end计算的长度超过了文件记录实际长度，则只设置到文件的末尾
         int end = this.start + position + size;
         // handle integer overflow or if end is beyond the end of the file
         if (end < 0 || end > start + currentSizeInBytes)
             end = start + currentSizeInBytes;
+        // 创建一个新的 FileRecords 对象，包括原文件路径，存储文件的 channel 通道，以及切分后文件记录的起始位置和终止位置
         return new FileRecords(file, channel, this.start + position, end, true);
     }
 
@@ -159,13 +163,18 @@ public class FileRecords extends AbstractRecords implements Closeable {
      * @param records The records to append
      * @return the number of bytes written to the underlying file
      */
+    // 将内存中的消息对象写入到操作系统的页缓存中。
     public int append(MemoryRecords records) throws IOException {
+        // 检查待写入的消息记录长度是否超过了当前日志段剩余的容量
         if (records.sizeInBytes() > Integer.MAX_VALUE - size.get())
             throw new IllegalArgumentException("Append of size " + records.sizeInBytes() +
                     " bytes is too large for segment with current file position at " + size.get());
 
+        // 将消息记录写入到文件通道中，并返回实际写入的字节数
         int written = records.writeFullyTo(channel);
+        // 更新日志段的大小
         size.getAndAdd(written);
+        // 返回写入的字节数
         return written;
     }
 

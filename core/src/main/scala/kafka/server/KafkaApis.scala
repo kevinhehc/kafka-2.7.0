@@ -568,6 +568,7 @@ class KafkaApis(val requestChannel: RequestChannel, // 请求通道
   def handleProduceRequest(request: RequestChannel.Request): Unit = {
     // 获取生产者发送的请求体信息 ProduceRequest
     val produceRequest = request.body[ProduceRequest]
+    // 计算需要写入数据的大小
     val numBytesAppended = request.header.toStruct.sizeOf + request.sizeOfBodyInBytes
 
     // 如果请求中包含事务性记录，则需要进行授权操作。
@@ -590,11 +591,17 @@ class KafkaApis(val requestChannel: RequestChannel, // 请求通道
       return
     }
 
+    // 客户端消息数据 scala格式
     val produceRecords = produceRequest.partitionRecordsOrFail.asScala
+    // 未授权topic的 response
     val unauthorizedTopicResponses = mutable.Map[TopicPartition, PartitionResponse]()
+    // 不存在topic的 response
     val nonExistingTopicResponses = mutable.Map[TopicPartition, PartitionResponse]()
+    // 无效请求的 response
     val invalidRequestResponses = mutable.Map[TopicPartition, PartitionResponse]()
+    // 授权的请求消息，每个 topicPartation 对应的需要写入的日志数据
     val authorizedRequestInfo = mutable.Map[TopicPartition, MemoryRecords]()
+    // 授权的 topics
     val authorizedTopics = filterByAuthorized(request.context, WRITE, TOPIC, produceRecords)(_._1.topic)
 
     // 遍历每个分区记录，对其进行授权和验证操作，构建相应的响应信息。
@@ -608,9 +615,12 @@ class KafkaApis(val requestChannel: RequestChannel, // 请求通道
       else
       // 如果分区记录通过了验证，则将其添加到已授权分区记录列表中，并将该分区记录发送给对应的 broker。
         try {
+          // 校验消息格式
           ProduceRequest.validateRecords(request.header.apiVersion, memoryRecords)
+          // 如果 broker 的元数据缓存包含该 topicPartition，将该二元组添加到 authorizedRequestInfo的 map 集合中。
           authorizedRequestInfo += (topicPartition -> memoryRecords)
         } catch {
+          // 抛异常
           case e: ApiException =>
             invalidRequestResponses += topicPartition -> new PartitionResponse(Errors.forException(e))
         }
@@ -684,20 +694,25 @@ class KafkaApis(val requestChannel: RequestChannel, // 请求通道
     if (authorizedRequestInfo.isEmpty)
       sendResponseCallback(Map.empty)
     else {
+      // 是否允许向内部主题写入消息判断
       val internalTopicsAllowed = request.header.clientId == AdminUtils.AdminClientId
 
       // call the replica manager to append messages to the replicas
+      // 调用 replicaManager 组件的方法，消息追加到磁盘的入口
       replicaManager.appendRecords(
         timeout = produceRequest.timeout.toLong,
         requiredAcks = produceRequest.acks,
         internalTopicsAllowed = internalTopicsAllowed,
         origin = AppendOrigin.Client,
         entriesPerPartition = authorizedRequestInfo,
+        // 最后返回响应结果，把响应添加到响应队列中。
         responseCallback = sendResponseCallback,
+        // 消息格式转换操作的回调统计逻辑，主要用于统计消息格式转换操作过程中的一些数据指标，比如总共转换了多少条消息，花费了多长时间。
         recordConversionStatsCallback = processingStatsCallback)
 
       // if the request is put into the purgatory, it will have a held reference and hence cannot be garbage collected;
       // hence we clear its data here in order to let GC reclaim its memory since it is already appended to log
+      // 帮助 GC 回收内存
       produceRequest.clearPartitionRecords()
     }
   }
@@ -705,18 +720,24 @@ class KafkaApis(val requestChannel: RequestChannel, // 请求通道
   /**
    * Handle a fetch request
    */
+  // 处理获取消息的请求
   def handleFetchRequest(request: RequestChannel.Request): Unit = {
+    // 获取请求的 API 版本和客户端 ID，以及请求的数据（FetchRequest）
     val versionId = request.header.apiVersion
     val clientId = request.header.clientId
+    // 把 RequestChannel.Request 转换为 FetchRequest 类型
     val fetchRequest = request.body[FetchRequest]
+    // 根据FetchRequest 构建 fetch 上下文对象 FetchContext并设置客户端元数据
     val fetchContext = fetchManager.newContext(
       fetchRequest.metadata,
       fetchRequest.fetchData,
       fetchRequest.toForget,
       fetchRequest.isFromFollower)
 
+    // 构建请求 Clients 的元数据
     val clientMetadata: Option[ClientMetadata] = if (versionId >= 11) {
       // Fetch API version 11 added preferred replica logic
+      // Fetch API 版本 >= 11 时才有一个新的 preferred replica 逻辑，需要设置 clientId 和其他相关信息
       Some(new DefaultClientMetadata(
         fetchRequest.rackId,
         clientId,
@@ -727,29 +748,42 @@ class KafkaApis(val requestChannel: RequestChannel, // 请求通道
       None
     }
 
+    // 创建错误响应，如果需要进行记录或者出错时使用
     def errorResponse[T >: MemoryRecords <: BaseRecords](error: Errors): FetchResponse.PartitionData[T] = {
+      // error: 错误代码
+      // highWatermark / lastStableOffset / logStartOffset: 长整型偏移值
+      // preferredReadReplica / abortedTransactions / divergingEpoch: 相关信息
+      // records: 消息记录数据
       new FetchResponse.PartitionData[T](error, FetchResponse.INVALID_HIGHWATERMARK, FetchResponse.INVALID_LAST_STABLE_OFFSET,
         FetchResponse.INVALID_LOG_START_OFFSET, null, MemoryRecords.EMPTY)
     }
 
+    // 错误返回，分别记录需要跳过和需要处理的分区信息，需要分情况处理
     val erroneous = mutable.ArrayBuffer[(TopicPartition, FetchResponse.PartitionData[Records])]()
+    // 需要拉取消息的 TopicPartition
     val interesting = mutable.ArrayBuffer[(TopicPartition, FetchRequest.PartitionData)]()
+    // 如果是 follower 发起的 Fetch 请求
     if (fetchRequest.isFromFollower) {
       // The follower must have ClusterAction on ClusterResource in order to fetch partition data.
       if (authorize(request.context, CLUSTER_ACTION, CLUSTER, CLUSTER_NAME)) {
+        // 首先需要授权才允许获取数据
         fetchContext.foreachPartition { (topicPartition, data) =>
           if (!metadataCache.contains(topicPartition))
+          // 如果对应分区不存在，则记录下该分区对应的错误代码
             erroneous += topicPartition -> errorResponse(Errors.UNKNOWN_TOPIC_OR_PARTITION)
           else
+          // 否则加入到需要处理的列表中
             interesting += (topicPartition -> data)
         }
       } else {
+        // 如果鉴权失败，则记录下该分区对应的错误代码
         fetchContext.foreachPartition { (part, _) =>
           erroneous += part -> errorResponse(Errors.TOPIC_AUTHORIZATION_FAILED)
         }
       }
     } else {
       // Regular Kafka consumers need READ permission on each partition they are fetching.
+      // 如果是普通的消费者，则需要通过授权来决定是否需要获取数据
       val partitionDatas = new mutable.ArrayBuffer[(TopicPartition, FetchRequest.PartitionData)]
       fetchContext.foreachPartition { (topicPartition, partitionData) =>
         partitionDatas += topicPartition -> partitionData
@@ -757,19 +791,25 @@ class KafkaApis(val requestChannel: RequestChannel, // 请求通道
       val authorizedTopics = filterByAuthorized(request.context, READ, TOPIC, partitionDatas)(_._1.topic)
       partitionDatas.foreach { case (topicPartition, data) =>
         if (!authorizedTopics.contains(topicPartition.topic))
+        // 如果对应主题没有被授权，则记录下该分区对应的错误代码
           erroneous += topicPartition -> errorResponse(Errors.TOPIC_AUTHORIZATION_FAILED)
         else if (!metadataCache.contains(topicPartition))
+        // 如果对应分区不存在，则记录下该分区对应的错误代码
           erroneous += topicPartition -> errorResponse(Errors.UNKNOWN_TOPIC_OR_PARTITION)
         else
+        // 否则加入到需要处理的列表中，构建需要拉取消息的
           interesting += (topicPartition -> data)
       }
     }
 
+    // 下面是具体的数据处理逻辑，首先需要处理下版本不兼容的情况，之后进行数据转换
     def maybeDownConvertStorageError(error: Errors, version: Short): Errors = {
       // If consumer sends FetchRequest V5 or earlier, the client library is not guaranteed to recognize the error code
       // for KafkaStorageException. In this case the client library will translate KafkaStorageException to
       // UnknownServerException which is not retriable. We can ensure that consumer will update metadata and retry
       // by converting the KafkaStorageException to NotLeaderForPartitionException in the response if FetchRequest version <= 5
+      // 如果请求版本是 Fetch API V5 或更早的版本，则客户端不能识别错误代码 KafkaStorageException
+      // 这时需要将该错误码转换为 NotLeaderForPartitionException，从而让客户端更新元数据并重新尝试
       if (error == Errors.KAFKA_STORAGE_ERROR && versionId <= 5) {
         Errors.NOT_LEADER_OR_FOLLOWER
       } else {
@@ -777,10 +817,12 @@ class KafkaApis(val requestChannel: RequestChannel, // 请求通道
       }
     }
 
+    // 下面是具体的数据格式转换逻辑
     def maybeConvertFetchedData(tp: TopicPartition,
                                 partitionData: FetchResponse.PartitionData[Records]): FetchResponse.PartitionData[BaseRecords] = {
       val logConfig = replicaManager.getLogConfig(tp)
 
+      // 检查消息是否被 ZStandard 压缩，如果是，且客户端版本不支持，则返回 UNSUPPORTED_COMPRESSION_TYPE 错误码
       if (logConfig.exists(_.compressionType == ZStdCompressionCodec.name) && versionId < 10) {
         trace(s"Fetching messages is disabled for ZStandard compressed partition $tp. Sending unsupported version response to $clientId.")
         errorResponse(Errors.UNSUPPORTED_COMPRESSION_TYPE)
@@ -792,6 +834,7 @@ class KafkaApis(val requestChannel: RequestChannel, // 请求通道
         // know it must be supported. However, if the magic version is changed from a higher version back to a
         // lower version, this check will no longer be valid and we will fail to down-convert the messages
         // which were written in the new format prior to the version downgrade.
+        // 判断是否需要进行降级转换
         val unconvertedRecords = partitionData.records
         val downConvertMagic =
           logConfig.map(_.messageFormatVersion.recordVersion.value).flatMap { magic =>
@@ -806,16 +849,21 @@ class KafkaApis(val requestChannel: RequestChannel, // 请求通道
         downConvertMagic match {
           case Some(magic) =>
             // For fetch requests from clients, check if down-conversion is disabled for the particular partition
+            // 如果保存的消息版本比客户端支持的版本高，则需要进行降级转换
             if (!fetchRequest.isFromFollower && !logConfig.forall(_.messageDownConversionEnable)) {
               trace(s"Conversion to message format ${downConvertMagic.get} is disabled for partition $tp. Sending unsupported version response to $clientId.")
+              // 普通客户端不支持降级转换则返回 UNSUPPORTED_VERSION 错误码
               errorResponse(Errors.UNSUPPORTED_VERSION)
             } else {
+              // 进行消息转换
               try {
+
                 trace(s"Down converting records from partition $tp to message format version $magic for fetch request from $clientId")
                 // Because down-conversion is extremely memory intensive, we want to try and delay the down-conversion as much
                 // as possible. With KIP-283, we have the ability to lazily down-convert in a chunked manner. The lazy, chunked
                 // down-conversion always guarantees that at least one batch of messages is down-converted and sent out to the
                 // client.
+                // 需要注意延迟加载为了避免内存占用过大的问题
                 val error = maybeDownConvertStorageError(partitionData.error, versionId)
                 new FetchResponse.PartitionData[BaseRecords](error, partitionData.highWatermark,
                   partitionData.lastStableOffset, partitionData.logStartOffset,
@@ -823,11 +871,13 @@ class KafkaApis(val requestChannel: RequestChannel, // 请求通道
                   new LazyDownConversionRecords(tp, unconvertedRecords, magic, fetchContext.getFetchOffset(tp).get, time))
               } catch {
                 case e: UnsupportedCompressionTypeException =>
+                  // 返回 UNSUPPORTED_COMPRESSION_TYPE 错误码
                   trace("Received unsupported compression type error during down-conversion", e)
                   errorResponse(Errors.UNSUPPORTED_COMPRESSION_TYPE)
               }
             }
           case None =>
+            // 如果不需要转换，则直接返回原始数据
             val error = maybeDownConvertStorageError(partitionData.error, versionId)
             new FetchResponse.PartitionData[BaseRecords](error,
               partitionData.highWatermark,
@@ -842,15 +892,22 @@ class KafkaApis(val requestChannel: RequestChannel, // 请求通道
     }
 
     // the callback for process a fetch response, invoked before throttling
+    // 处理 Fetch 响应的回调函数，在执行流控之前调用
     def processResponseCallback(responsePartitionData: Seq[(TopicPartition, FetchPartitionData)]): Unit = {
+      // 构建一个 LinkedHashMap 来存储所有分区的数据
       val partitions = new util.LinkedHashMap[TopicPartition, FetchResponse.PartitionData[Records]]
+      // 构建一个可变的 Set 来存储正在重新分配的分区
       val reassigningPartitions = mutable.Set[TopicPartition]()
+      // 遍历分区处理响应数据
       responsePartitionData.foreach { case (tp, data) =>
         val abortedTransactions = data.abortedTransactions.map(_.asJava).orNull
         val lastStableOffset = data.lastStableOffset.getOrElse(FetchResponse.INVALID_LAST_STABLE_OFFSET)
+        // 如果该分区是正在重新分配的分区，则保存到 reassigningPartitions 中
         if (data.isReassignmentFetch)
           reassigningPartitions.add(tp)
+        // 获取该分区的错误信息，如果没有错误则为 NONE
         val error = maybeDownConvertStorageError(data.error, versionId)
+        // 将分区数据转换为 FetchResponse.PartitionData 格式
         partitions.put(tp, new FetchResponse.PartitionData(
           error,
           data.highWatermark,
@@ -861,30 +918,39 @@ class KafkaApis(val requestChannel: RequestChannel, // 请求通道
           data.divergingEpoch.asJava,
           data.records))
       }
+      // 处理异常数据的情况
       erroneous.foreach { case (tp, data) => partitions.put(tp, data) }
-
+      // 创建一个空的 FetchResponse
       var unconvertedFetchResponse: FetchResponse[Records] = null
 
+      // 创建 Fetch 响应对象的函数
       def createResponse(throttleTimeMs: Int): FetchResponse[BaseRecords] = {
         // Down-convert messages for each partition if required
+        // 新建一个 LinkedHashMap 来保存转换后的分区数据
         val convertedData = new util.LinkedHashMap[TopicPartition, FetchResponse.PartitionData[BaseRecords]]
+        // 遍历所有分区的未转换数据
         unconvertedFetchResponse.responseData.forEach { (tp, unconvertedPartitionData) =>
           if (unconvertedPartitionData.error != Errors.NONE)
+          // 如果该分区有错误，则打印日志
             debug(s"Fetch request with correlation id ${request.header.correlationId} from client $clientId " +
               s"on partition $tp failed due to ${unconvertedPartitionData.error.exceptionName}")
+          // 将该分区的未转换数据进行转换
           convertedData.put(tp, maybeConvertFetchedData(tp, unconvertedPartitionData))
         }
 
         // Prepare fetch response from converted data
+        // 构建一个新的 FetchResponse
         val response = new FetchResponse(unconvertedFetchResponse.error, convertedData, throttleTimeMs,
           unconvertedFetchResponse.sessionId)
         // record the bytes out metrics only when the response is being sent
+        // 更新日志统计信息
         response.responseData.forEach { (tp, data) =>
           brokerTopicStats.updateBytesOut(tp.topic, fetchRequest.isFromFollower, reassigningPartitions.contains(tp), data.records.sizeInBytes)
         }
         response
       }
 
+      // 更新记录数据转换统计信息的函数
       def updateConversionStats(send: Send): Unit = {
         send match {
           case send: MultiRecordsSend if send.recordConversionStats != null =>
@@ -895,6 +961,7 @@ class KafkaApis(val requestChannel: RequestChannel, // 请求通道
         }
       }
 
+      // 如果 Fetch 请求来自 Follower 节点，则不需要流控，直接返回响应数据
       if (fetchRequest.isFromFollower) {
         // We've already evaluated against the quota and are good to go. Just need to record it now.
         unconvertedFetchResponse = fetchContext.updateAndGenerateResponseData(partitions)
@@ -943,27 +1010,36 @@ class KafkaApis(val requestChannel: RequestChannel, // 请求通道
     // for fetch from consumer, cap fetchMaxBytes to the maximum bytes that could be fetched without being throttled given
     // no bytes were recorded in the recent quota window
     // trying to fetch more bytes would result in a guaranteed throttling potentially blocking consumer progress
+    // 限流的最大字节数取决于请求的 maxBytes 和配额窗口内的最大字节数的最小值
     val maxQuotaWindowBytes = if (fetchRequest.isFromFollower)
       Int.MaxValue
     else
       quotas.fetch.getMaxValueInQuotaWindow(request.session, clientId).toInt
 
+    //确定拉取消息的大小
     val fetchMaxBytes = Math.min(Math.min(fetchRequest.maxBytes, config.fetchMaxBytes), maxQuotaWindowBytes)
     val fetchMinBytes = Math.min(fetchRequest.minBytes, fetchMaxBytes)
+    // 如果没有分区被关注，则无需进行处理
     if (interesting.isEmpty)
       processResponseCallback(Seq.empty)
     else {
       // call the replica manager to fetch messages from the local replica
+      // 调用 ReplicaManager 从本地的 Replica 副本中获取消息
       replicaManager.fetchMessages(
         fetchRequest.maxWait.toLong,
         fetchRequest.replicaId,
         fetchMinBytes,
         fetchMaxBytes,
         versionId <= 2,
+        // 规定了读取分区的信息，比如要读取哪些分区、从这些分区的哪个位移值开始读、最多可以读多少字节，等等
         interesting,
+        // 配额控制类，读取消息过程是否需要流量控制
         replicationQuota(fetchRequest),
+        // 消息拉取完成后的回调函数
         processResponseCallback,
+        //事务消息
         fetchRequest.isolationLevel,
+        // 客户端元数据
         clientMetadata)
     }
   }

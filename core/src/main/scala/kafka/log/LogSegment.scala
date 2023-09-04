@@ -53,6 +53,10 @@ import scala.math._
  * @param time The time instance
  */
 @nonthreadsafe
+// 「消息日志文件」、
+// 「位移索引文件」、
+// 「时间戳索引文件」、
+// 「已终止事务文件」
 class LogSegment private[log] (val log: FileRecords,
                                val lazyOffsetIndex: LazyIndex[OffsetIndex],
                                val lazyTimeIndex: LazyIndex[TimeIndex],
@@ -141,33 +145,47 @@ class LogSegment private[log] (val log: FileRecords,
    * @throws LogSegmentOffsetOverflowException if the largest offset causes index offset overflow
    */
   @nonthreadsafe
-  def append(largestOffset: Long,
-             largestTimestamp: Long,
-             shallowOffsetOfMaxTimestamp: Long,
-             records: MemoryRecords): Unit = {
+  def append(largestOffset: Long, // 最大位移
+             largestTimestamp: Long, // 最大时间戳
+             shallowOffsetOfMaxTimestamp: Long, // 最大时间戳对应消息的位移
+             records: MemoryRecords): Unit = { // 真正要写入的消息集合
     if (records.sizeInBytes > 0) {
       trace(s"Inserting ${records.sizeInBytes} bytes at end offset $largestOffset at position ${log.sizeInBytes} " +
             s"with largest timestamp $largestTimestamp at shallow offset $shallowOffsetOfMaxTimestamp")
+      // 判断该日志段是否为空
       val physicalPosition = log.sizeInBytes()
       if (physicalPosition == 0)
+        // 记录要写入消息集合的最大时间戳，并将其作为后面新增日志段倒计时的依据
         rollingBasedTimestamp = Some(largestTimestamp)
 
+      // 确保输入参数最大位移值是合法的
       ensureOffsetInRange(largestOffset)
 
       // append the messages
+      // 这里是一个 FileRecords 实例，调用其 append 方法将内存中的消息对象写入到操作系统的页缓存。
       val appendedBytes = log.append(records)
       trace(s"Appended $appendedBytes to ${log.file} at end offset $largestOffset")
       // Update the in memory max timestamp and corresponding offset.
+      // 更新日志段的最大时间戳以及最大时间戳所属消息的位移值属性
       if (largestTimestamp > maxTimestampSoFar) {
+        // 最大时间戳
         maxTimestampSoFar = largestTimestamp
+        // 最大时间戳对应消息的位移
         offsetOfMaxTimestampSoFar = shallowOffsetOfMaxTimestamp
       }
       // append an entry to the index (if needed)
+      // hhc1
+      // 更新索引项和写入的字节数，kafka 保证时间戳索引项保存时间戳与消息位移的对应关系
+      // 索引是稀疏哈希索引，不是每条消息都对应一条索引。写 4K 即4096字节，会更新一次索引。
       if (bytesSinceLastIndexEntry > indexIntervalBytes) {
+        // 追加索引项
         offsetIndex.append(largestOffset, physicalPosition)
+        // 更新 timeIndex
         timeIndex.maybeAppend(maxTimestampSoFar, offsetOfMaxTimestampSoFar)
+        // 索引写完后重置，继续 4K 字节写索引
         bytesSinceLastIndexEntry = 0
       }
+      // 计算累计写入 .log 文件的消息大小
       bytesSinceLastIndexEntry += records.sizeInBytes
     }
   }
@@ -271,7 +289,9 @@ class LogSegment private[log] (val log: FileRecords,
    */
   @threadsafe
   private[log] def translateOffset(offset: Long, startingFilePosition: Int = 0): LogOffsetPosition = {
+    // 在 .index 索引文件中，查找 relativeOffset 对应的 <relativeOffset,position>
     val mapping = offsetIndex.lookup(offset)
+    // 在 .log 日志文件中，查找对应的是 position 物理位置对应的消息，与 relativeOffset 进行匹配
     log.searchForOffsetWithSize(offset, max(mapping.position, startingFilePosition))
   }
 
@@ -288,33 +308,41 @@ class LogSegment private[log] (val log: FileRecords,
    *         or null if the startOffset is larger than the largest offset in this log
    */
   @threadsafe
-  def read(startOffset: Long,
-           maxSize: Int,
-           maxPosition: Long = size,
-           minOneMessage: Boolean = false): FetchDataInfo = {
+  def read(startOffset: Long, // 要读取的第一条消息的位移
+           maxSize: Int, // 能读取的最大字节数
+           maxPosition: Long = size, // 能读到的最大文件位置
+           minOneMessage: Boolean = false): FetchDataInfo = { // 是否允许在消息体过大时至少返回第一条消息
     if (maxSize < 0)
       throw new IllegalArgumentException(s"Invalid max size $maxSize for log read from segment $log")
 
+    // 根据索引信息找到对应的物理文件位置
     val startOffsetAndSize = translateOffset(startOffset)
 
     // if the start position is already off the end of the log, return null
     if (startOffsetAndSize == null)
       return null
 
+    // 起始物理位置
     val startPosition = startOffsetAndSize.position
+    // 位移元数据
     val offsetMetadata = LogOffsetMetadata(startOffset, this.baseOffset, startPosition)
 
+    // 物理文件最大值和要查询的最大值，取最大的
     val adjustedMaxSize =
       if (minOneMessage) math.max(maxSize, startOffsetAndSize.size)
       else maxSize
 
     // return a log segment but with zero size in the case below
+    // 如果指定的最大字节数为0，则返回一个空的日志记录
     if (adjustedMaxSize == 0)
       return FetchDataInfo(offsetMetadata, MemoryRecords.EMPTY)
 
     // calculate the length of the message set to read based on whether or not they gave us a maxOffset
+    // 假设 maxSize=100，maxPosition=300，startPosition=250，那么 read 方法只能读取 50 字节，
+    // 因为 maxPosition - startPosition = 50。我们把它和 maxSize 参数相比较，其中的最小值就是最终能够读取的总字节数
     val fetchSize: Int = min((maxPosition - startPosition).toInt, adjustedMaxSize)
 
+    // 调用 FileRecords 的 slice 方法，从指定位置读取指定大小的消息集合
     FetchDataInfo(offsetMetadata, log.slice(startPosition, fetchSize),
       firstEntryIncomplete = adjustedMaxSize < startOffsetAndSize.size)
   }
