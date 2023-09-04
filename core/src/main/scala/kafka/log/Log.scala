@@ -746,37 +746,61 @@ class Log(@volatile private var _dir: File, // 当前日志目录
    * @throws LogSegmentOffsetOverflowException if we encounter a .swap file with messages that overflow index offset; or when
    *                                           we find an unexpected number of .log files with overflow
    */
+
+  /*
+   * 从磁盘上的日志文件中加载日志段并返回下一个偏移量。此方法不需要将 IOException 转换为 KafkaStorageException，
+   * 因为它只在加载所有日志之前调用。
+   * 如果遇到具有溢出索引偏移的消息的 .swap 文件，则抛出 LogSegmentOffsetOverflowException 异常；
+   * 或者当我们发现具有溢出的 .log 文件的数量时抛出异常
+   */
   private def loadSegments(): Long = {
     // first do a pass through the files in the log directory and remove any temporary files
     // and find any interrupted swap operations
+    // 1、首先对日志目录中的文件进行遍历，并清理上次 Failure 遗留下来的各种临时文件（包括以".delete"、".cleaned"、".swap" 结尾的文件），
+    // 收集Swap文件并查找任何中断的 swap 操作。
     val swapFiles = removeTempFilesAndCollectSwapFiles()
 
     // Now do a second pass and load all the log and index files.
     // We might encounter legacy log segments with offset overflow (KAFKA-6264). We need to split such segments. When
     // this happens, restart loading segment files from scratch.
+    // 现在进行第二次遍历，并加载所有的日志和索引文件
+    // 我们可能会遇到具有偏移量溢出的旧日志段（KAFKA-6264）。
+    // 我们需要拆分这样的段。当遇到这种情况时，重新从头开始加载段文件。
     retryOnOffsetOverflow {
       // In case we encounter a segment with offset overflow, the retry logic will split it after which we need to retry
       // loading of segments. In that case, we also need to close all segments that could have been left open in previous
       // call to loadSegmentFiles().
+      // 如果遇到具有偏移量溢出的段，重试逻辑将对其进行拆分，然后我们需要重试加载段文件。
+      // 在发起此次 loadSegmentFiles() 调用之前需要关闭所有被遗留的日志段
       logSegments.foreach(_.close())
+      // 清空所有日志段对象
       segments.clear()
+      // 再次遍历分区日志路径，载入 Segment 和 Index 文件，将 Segment依次加入 cache 中
       loadSegmentFiles()
     }
 
     // Finally, complete any interrupted swap operations. To be crash-safe,
     // log files that are replaced by the swap segment should be renamed to .deleted
     // before the swap file is restored as the new segment file.
+    // 3、待执行完上面两次遍历后，完成恢复过程中发现任何中断的 swap 操作。
+    // 载入 SwapSegment 并替换对应的 Segment，为了保证安全，
+    // 被 swap 段取代的日志文件应该在恢复 swap 文件作为新段文件之前将其重命名为 .deleted，后面的定时任务或者下次的系统重启会删除。
     completeSwapOperations(swapFiles)
 
+    // 如果当前目录是标准目录而不是被标记为“.deleted”，则恢复日志段对象、重置当前活跃日志段的索引大小、返回恢复之后的分区日志 LEO 值。
     if (!dir.getAbsolutePath.endsWith(Log.DeleteDirSuffix)) {
       val nextOffset = retryOnOffsetOverflow {
+        // 根据 snapshot 恢复 Segment 各种缓存，根据 record 进行事务处理初始化等工作
         recoverLog()
       }
 
       // reset the index size of the currently active log segment to allow more entries
+      // 重置当前活跃日志段的索引大小，以允许更多的条目。
       activeSegment.resizeIndexes(config.maxIndexSize)
+      // 返回恢复之后的分区日志 LEO 值。
       nextOffset
     } else {
+      // 如果日志目录下没有 segment 文件，就创建一个 activeSegment 作为起始，需要保证 Log 中至少有一个 LogSegment。
        if (logSegments.isEmpty) {
           addSegment(LogSegment.open(dir = dir,
             baseOffset = 0,
@@ -786,6 +810,7 @@ class Log(@volatile private var _dir: File, // 当前日志目录
             initFileSize = this.initFileSize,
             preallocate = false))
        }
+      // 目录被标记为“.deleted”时，将下一个偏移量设置为 0
       0
     }
   }
@@ -2578,26 +2603,34 @@ class Log(@volatile private var _dir: File, // 当前日志目录
 object Log {
 
   /** a log file */
+  // Log 的目录，用于存储日志文件。
   val LogFileSuffix = ".log"
 
   /** an index file */
+  //  Log 的目录，用于存储索引文件。
   val IndexFileSuffix = ".index"
 
   /** a time index file */
+  // Log 的目录，用于存储时间索引文件。
   val TimeIndexFileSuffix = ".timeindex"
 
+  // Kafka 为幂等型或事务型 Producer 所做的快照文件
   val ProducerSnapshotFileSuffix = ".snapshot"
 
   /** an (aborted) txn index */
+  // Kafka 为事务消息所做的已终止事务索引文件。
   val TxnIndexFileSuffix = ".txnindex"
 
   /** a file that is scheduled to be deleted */
+  // 删除日志段操作创建的文件。目前删除日志段文件是异步任务操作，Broker 端把日志段文件从 .log 后缀修改为 .deleted 后缀。
   val DeletedFileSuffix = ".deleted"
 
   /** A temporary file that is being used for log cleaning */
+  //  Compaction 操作的产物
   val CleanedFileSuffix = ".cleaned"
 
   /** A temporary file used when swapping files into the log */
+  // Compaction 操作的产物
   val SwapFileSuffix = ".swap"
 
   /** Clean shutdown file that indicates the broker was cleanly shutdown in 0.8 and higher.
@@ -2606,12 +2639,15 @@ object Log {
    * requires accessing the offset index which may not be safe in an unclean shutdown.
    * For more information see the discussion in PR#2104
    */
+  //  Clean shutdown文件，存在表示 kafka 正在做清理性的停机工作。
   val CleanShutdownFile = ".kafka_cleanshutdown"
 
   /** a directory that is scheduled to be deleted */
+  // 主要用在文件夹中的。当你删除一个主题的时候，主题对应分区的文件夹会被加上该后缀。
   val DeleteDirSuffix = "-delete"
 
   /** a directory that is used for future partition */
+  // 主要用在变更主题分区文件夹地址的。
   val FutureDirSuffix = "-future"
 
   private[log] val DeleteDirPattern = Pattern.compile(s"^(\\S+)-(\\S+)\\.(\\S+)$DeleteDirSuffix")

@@ -41,15 +41,22 @@ import java.util.concurrent.atomic.AtomicInteger;
  * instance to enable slicing a range of the log records.
  */
 public class FileRecords extends AbstractRecords implements Closeable {
+    // 是否为分片。isSlice为false，说明文件是原始的日志文件，是可以追加的；如果isSlice为true，那么就是截取日志的一个片段。
     private final boolean isSlice;
+    // 分片的开始位置。
     private final int start;
+    // 分片的结束位置。
     private final int end;
 
+    // 组成 FileRecords的消息批次。
     private final Iterable<FileLogInputStream.FileChannelRecordBatch> batches;
 
     // mutable state
+    // 如果是分片，则表示分片的大小（end - start）；如果不是分片，则表示整个日志文件的大小。
     private final AtomicInteger size;
+    // FileChannel 类型，用于读写对应的日志文件。
     private final FileChannel channel;
+    // 磁盘上的日志文件。
     private volatile File file;
 
     /**
@@ -134,6 +141,14 @@ public class FileRecords extends AbstractRecords implements Closeable {
      * @param size The number of bytes after the start position to include
      * @return A sliced wrapper on this message set limited based on the given position and size
      */
+    /*
+     * 从给定位置以及给定大小创建一个新的 FileRecords 对象，表示原记录对象的前缀
+     *
+     * @param position 关于原始数据的偏移量
+     * @param size 被选中数据集的大小
+     * @throws IOException
+     * @returns 从偏移量开始的给定大小的记录对象
+     */
     public FileRecords slice(int position, int size) throws IOException {
         // Cache current size in case concurrent write changes it
         // 缓存当前文件记录大小以防并发写入改变它
@@ -171,6 +186,7 @@ public class FileRecords extends AbstractRecords implements Closeable {
                     " bytes is too large for segment with current file position at " + size.get());
 
         // 将消息记录写入到文件通道中，并返回实际写入的字节数
+        // 把内存中的消息数据写入 channel，即写入 PageCache 中，需要后面刷盘
         int written = records.writeFullyTo(channel);
         // 更新日志段的大小
         size.getAndAdd(written);
@@ -181,6 +197,7 @@ public class FileRecords extends AbstractRecords implements Closeable {
     /**
      * Commit all written data to the physical disk
      */
+    // 把消息刷写到磁盘的方法
     public void flush() throws IOException {
         channel.force(true);
     }
@@ -249,15 +266,26 @@ public class FileRecords extends AbstractRecords implements Closeable {
      * @param targetSize The size to truncate to. Must be between 0 and sizeInBytes.
      * @return The number of bytes truncated off
      */
+    /*`
+     * 将日志段截断至指定大小
+     *
+     * @param targetSize 截断后目标大小
+     * @throws IOException
+     * @returns 返回截断前和截断后的大小差值
+     */
     public int truncateTo(int targetSize) throws IOException {
         int originalSize = sizeInBytes();
+        // 目标大小不能超过原始大小或小于0
         if (targetSize > originalSize || targetSize < 0)
             throw new KafkaException("Attempt to truncate log segment " + file + " to " + targetSize + " bytes failed, " +
                     " size of this log segment is " + originalSize + " bytes.");
+        // 如果目标大小小于文件大小，则截断文件
         if (targetSize < (int) channel.size()) {
             channel.truncate(targetSize);
+            // 更新记录中的文件大小属性
             size.set(targetSize);
         }
+        // 返回截断前和截断后的大小差值
         return originalSize - targetSize;
     }
 
@@ -307,12 +335,25 @@ public class FileRecords extends AbstractRecords implements Closeable {
      * @param targetOffset The offset to search for.
      * @param startingPosition The starting position in the file to begin searching from.
      */
+    /*
+     * 在指定的位置开始扫描数据并线性搜索偏移量不小于目标偏移量的第一条记录批次，
+     * 并返回该记录批次的日志位移量和其在文件中的位置
+     *
+     * @param targetOffset 目标偏移量
+     * @param startingPosition 指定扫描的起始位置
+     * @return 日志位移量和记录批次的文件绝对位置
+     */
     public LogOffsetPosition searchForOffsetWithSize(long targetOffset, int startingPosition) {
+        //从指定位置开始，线性搜索数据
         for (FileChannelRecordBatch batch : batchesFrom(startingPosition)) {
+            //当前批次的最后一个偏移量
             long offset = batch.lastOffset();
+            //偏移量不小于目标偏移量
             if (offset >= targetOffset)
+                //返回此时的偏移量及位置
                 return new LogOffsetPosition(offset, batch.position(), batch.sizeInBytes());
         }
+        //未找到偏移量不小于目标偏移量的记录批次时，返回 `null`
         return null;
     }
 

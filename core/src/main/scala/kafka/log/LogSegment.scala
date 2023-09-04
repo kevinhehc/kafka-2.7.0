@@ -71,9 +71,16 @@ class LogSegment private[log] (val log: FileRecords,
   def timeIndex: TimeIndex = lazyTimeIndex.get
 
   def shouldRoll(rollParams: RollParams): Boolean = {
+    // 计算多久没有新建日志分段文件了。
     val reachedRollMs = timeWaitedForRoll(rollParams.now, rollParams.maxTimestampInMessages) > rollParams.maxSegmentMs - rollJitterMs
+    // 需要新建日志段的条件
     size > rollParams.maxSegmentBytes - rollParams.messagesSize ||
-      (size > 0 && reachedRollMs) ||
+      // 当前日志段大小超过了阈值
+      // 当前时间已经超过了 log.roll.hours
+      // 偏移量索引已满
+      // 时间戳索引已满
+      // 无法将 maxOffsetInMessages 转换为相对偏移量
+    (size > 0 && reachedRollMs) ||
       offsetIndex.isFull || timeIndex.isFull || !canConvertToRelativeOffset(rollParams.maxOffsetInMessages)
   }
 
@@ -95,16 +102,20 @@ class LogSegment private[log] (val log: FileRecords,
     else throw new NoSuchFileException(s"Offset index file ${lazyOffsetIndex.file.getAbsolutePath} does not exist")
   }
 
+  //当前logSegment的创建时间
   private var created = time.milliseconds
 
   /* the number of bytes since we last added an entry in the offset index */
+  //自上次添加索引项之后，在log文件中累计加入的消息字节数
   private var bytesSinceLastIndexEntry = 0
 
   // The timestamp we used for time based log rolling and for ensuring max compaction delay
   // volatile for LogCleaner to see the update
+
   @volatile private var rollingBasedTimestamp: Option[Long] = None
 
   /* The maximum timestamp we see so far */
+  //已追加消息的最大时间戳
   @volatile private var _maxTimestampSoFar: Option[Long] = None
   def maxTimestampSoFar_=(timestamp: Long): Unit = _maxTimestampSoFar = Some(timestamp)
   def maxTimestampSoFar: Long = {
@@ -113,6 +124,7 @@ class LogSegment private[log] (val log: FileRecords,
     _maxTimestampSoFar.get
   }
 
+  //已追加的具备最大时间戳的消息对应的offset
   @volatile private var _offsetOfMaxTimestampSoFar: Option[Long] = None
   def offsetOfMaxTimestampSoFar_=(offset: Long): Unit = _offsetOfMaxTimestampSoFar = Some(offset)
   def offsetOfMaxTimestampSoFar: Long = {
@@ -127,7 +139,15 @@ class LogSegment private[log] (val log: FileRecords,
   /**
    * checks that the argument offset can be represented as an integer offset relative to the baseOffset.
    */
+
+  /*
+   * 检查给定偏移量是否可以转换为基础偏移量的相对偏移量
+   *
+   * @param offset 给定的偏移量
+   * @return 如果可以，则返回 true；否则返回 false
+   */
   def canConvertToRelativeOffset(offset: Long): Boolean = {
+    // 检查偏移量是否可以追加到偏移量索引中
     offsetIndex.canAppendOffset(offset)
   }
 
@@ -153,12 +173,15 @@ class LogSegment private[log] (val log: FileRecords,
       trace(s"Inserting ${records.sizeInBytes} bytes at end offset $largestOffset at position ${log.sizeInBytes} " +
             s"with largest timestamp $largestTimestamp at shallow offset $shallowOffsetOfMaxTimestamp")
       // 判断该日志段是否为空
+      // 计算当前消息偏移量所对应的物理地址，即获取 FileRecords 文件的末尾，它就是本次消息要写入的物理地址。
       val physicalPosition = log.sizeInBytes()
       if (physicalPosition == 0)
         // 记录要写入消息集合的最大时间戳，并将其作为后面新增日志段倒计时的依据
         rollingBasedTimestamp = Some(largestTimestamp)
 
       // 确保输入参数最大位移值是合法的
+      // 确保当前消息偏移量不超出日志段范围，就是看它与日志段起始位移的差值是否在整数范围内，
+      // 即 largestOffset - baseOffset 的值是不是介于 [0，Int.MAXVALUE] 之间
       ensureOffsetInRange(largestOffset)
 
       // append the messages
@@ -185,7 +208,7 @@ class LogSegment private[log] (val log: FileRecords,
         // 索引写完后重置，继续 4K 字节写索引
         bytesSinceLastIndexEntry = 0
       }
-      // 计算累计写入 .log 文件的消息大小
+      // 计算累计写入 .log 文件的消息大小 如果不需要写索引时，将这批数据追加到 bytesSinceLastIndexEntry 写入字节数中,以便下次重新累计计算
       bytesSinceLastIndexEntry += records.sizeInBytes
     }
   }
@@ -309,9 +332,12 @@ class LogSegment private[log] (val log: FileRecords,
    */
   @threadsafe
   def read(startOffset: Long, // 要读取的第一条消息的位移
-           maxSize: Int, // 能读取的最大字节数
+           maxSize: Int, // 能读取的最大字节数 默认是1M
            maxPosition: Long = size, // 能读到的最大文件位置
            minOneMessage: Boolean = false): FetchDataInfo = { // 是否允许在消息体过大时至少返回第一条消息
+    //，引入这个参数主要是为了确保不出现消费饿死的情况。
+
+
     if (maxSize < 0)
       throw new IllegalArgumentException(s"Invalid max size $maxSize for log read from segment $log")
 
@@ -362,64 +388,90 @@ class LogSegment private[log] (val log: FileRecords,
    */
   @nonthreadsafe
   def recover(producerStateManager: ProducerStateManager, leaderEpochCache: Option[LeaderEpochFileCache] = None): Int = {
+    // 调用索引对象的reset方法清空所有的索引文件
     offsetIndex.reset()
     timeIndex.reset()
     txnIndex.reset()
+    // 重置字节数
     var validBytes = 0
+    // 重置索引记录
     var lastIndexEntry = 0
+    // 重置最大时间戳
     maxTimestampSoFar = RecordBatch.NO_TIMESTAMP
     try {
+      // 遍历日志段文件中所有消息集合
       for (batch <- log.batches.asScala) {
+        // 检查消息集合内容是否符合kafka的二进制格式
         batch.ensureValid()
+        // 检查消息位移值合法性，确保该集合中最后一条消息的位移值不能越界，即它与日志段起始位移的差值必须是一个正整数值。
         ensureOffsetInRange(batch.lastOffset)
 
         // The max timestamp is exposed at the batch level, so no need to iterate the records
+        // 更新最大时间戳及所属消息的位移值，后续用于时间戳索引
         if (batch.maxTimestamp > maxTimestampSoFar) {
+          // 最大时间戳
           maxTimestampSoFar = batch.maxTimestamp
+          // 所属消息的位移值
           offsetOfMaxTimestampSoFar = batch.lastOffset
         }
 
         // Build offset index
+        // 重建位移索引，如果大于指定的字节大小，则新增索引项
         if (validBytes - lastIndexEntry > indexIntervalBytes) {
+          // 更新位移索引记录的位移值和物理文件位置（字节数）的对应关系
           offsetIndex.append(batch.lastOffset, validBytes)
           timeIndex.maybeAppend(maxTimestampSoFar, offsetOfMaxTimestampSoFar)
           lastIndexEntry = validBytes
         }
+        // 累计当前已读取的消息字节数
         validBytes += batch.sizeInBytes()
 
+        // 处理生产者状态信息（如果消息格式为 V2 或以上版本）
         if (batch.magic >= RecordBatch.MAGIC_VALUE_V2) {
+          // 更新 Leader Epoch 缓存
           leaderEpochCache.foreach { cache =>
             if (batch.partitionLeaderEpoch >= 0 && cache.latestEpoch.forall(batch.partitionLeaderEpoch > _))
               cache.assign(batch.partitionLeaderEpoch, batch.baseOffset)
           }
+          // 更新事务型 Producer 的状态
           updateProducerState(producerStateManager, batch)
         }
       }
     } catch {
+      // 如果在处理批次记录时出现无效记录，则记录一条警告信息
       case e@ (_: CorruptRecordException | _: InvalidRecordException) =>
         warn("Found invalid messages in log segment %s at byte offset %d: %s. %s"
           .format(log.file.getAbsolutePath, validBytes, e.getMessage, e.getCause))
     }
     val truncated = log.sizeInBytes - validBytes
+    // 此时 Kafka 会将日志段当前总字节数减去刚刚累加的已读取字节数，如果大于 0 说明日志段写入了一些非法无效消息，需要执行截断操作，
+    // 将日志段大小调整回合法的数值。同时调整索引文件的大小。
     if (truncated > 0)
       debug(s"Truncated $truncated invalid bytes at the end of segment ${log.file.getAbsoluteFile} during recovery")
 
+    // 消息本体截断
     log.truncateTo(validBytes)
+    // 位移索引对应截断
     offsetIndex.trimToValidSize()
     // A normally closed segment always appends the biggest timestamp ever seen into log segment, we do this as well.
+    // 确保更新时间戳索引
     timeIndex.maybeAppend(maxTimestampSoFar, offsetOfMaxTimestampSoFar, skipFullCheck = true)
+    // 时间戳索引截断
     timeIndex.trimToValidSize()
     truncated
   }
 
   private def loadLargestTimestamp(): Unit = {
     // Get the last time index entry. If the time index is empty, it will return (-1, baseOffset)
+    // 获取时间戳索引中最后一个条目，如果时间戳索引为空，则返回 (-1, 基础偏移量)
     val lastTimeIndexEntry = timeIndex.lastEntry
     maxTimestampSoFar = lastTimeIndexEntry.timestamp
     offsetOfMaxTimestampSoFar = lastTimeIndexEntry.offset
 
+    // 查找当前时间戳最大的那条消息的 offset 位置
     val offsetPosition = offsetIndex.lookup(lastTimeIndexEntry.offset)
     // Scan the rest of the messages to see if there is a larger timestamp after the last time index entry.
+    // 在该消息后面扫描剩余消息，看是否存在时间戳更大的消息
     val maxTimestampOffsetAfterLastEntry = log.largestTimestampAfter(offsetPosition.position)
     if (maxTimestampOffsetAfterLastEntry.timestamp > lastTimeIndexEntry.timestamp) {
       maxTimestampSoFar = maxTimestampOffsetAfterLastEntry.timestamp
@@ -451,28 +503,39 @@ class LogSegment private[log] (val log: FileRecords,
    * @param offset The offset to truncate to
    * @return The number of log bytes truncated
    */
+  // 将日志段截断到指定偏移量
+  // offset 指定的偏移量
+  // return 被截断的字节数
   @nonthreadsafe
   def truncateTo(offset: Long): Int = {
     // Do offset translation before truncating the index to avoid needless scanning
     // in case we truncate the full index
+    // 根据位移查找索引
     val mapping = translateOffset(offset)
+
+    // 处理位移量索引、时间戳索引和事务信息索引
     offsetIndex.truncateTo(offset)
     timeIndex.truncateTo(offset)
     txnIndex.truncateTo(offset)
 
     // After truncation, reset and allocate more space for the (new currently active) index
+    // 然后分配更多空间给位移量索引和时间戳索引
     offsetIndex.resize(offsetIndex.maxIndexSize)
     timeIndex.resize(timeIndex.maxIndexSize)
 
+    // 紧接着，利用偏移量索引来截断日志文件
     val bytesTruncated = if (mapping == null) 0 else log.truncateTo(mapping.position)
+    // 如果日志文件为空，则重置日志段相关变量
     if (log.sizeInBytes == 0) {
       created = time.milliseconds
       rollingBasedTimestamp = None
     }
 
     bytesSinceLastIndexEntry = 0
+    // 重新载入最大时间戳
     if (maxTimestampSoFar >= 0)
       loadLargestTimestamp()
+    // 返回被截断的字节数
     bytesTruncated
   }
 
@@ -497,6 +560,7 @@ class LogSegment private[log] (val log: FileRecords,
   @threadsafe
   def flush(): Unit = {
     LogFlushStats.logFlushTimer.time {
+      // 分别刷入日志、位移量索引、时间戳索引和事务信息索引
       log.flush()
       offsetIndex.flush()
       timeIndex.flush()
@@ -559,11 +623,22 @@ class LogSegment private[log] (val log: FileRecords,
    * segment is rolled if the difference between the current wall clock time and the segment create time exceeds the
    * segment rolling time.
    */
+
+  /*
+   * 计算检查点上次写入时间以来经过了多长时间
+   *
+   * @param now              当前时间
+   * @param messageTimestamp 所有消息记录中的最新时间戳
+   * @return 经过的时间
+   */
   def timeWaitedForRoll(now: Long, messageTimestamp: Long) : Long = {
     // Load the timestamp of the first message into memory
+    // 载入第一条记录的时间戳
     loadFirstBatchTimestamp()
     rollingBasedTimestamp match {
+      // 根据记录的滚动时间计算
       case Some(t) if t >= 0 => messageTimestamp - t
+      // 如果没有记录的滚动时间，则使用文件创建时间计算
       case _ => now - created
     }
   }
@@ -707,6 +782,7 @@ object LogSegment {
   }
 }
 
+// 负责为日志落盘进行计时
 object LogFlushStats extends KafkaMetricsGroup {
   val logFlushTimer = new KafkaTimer(newTimer("LogFlushRateAndTimeMs", TimeUnit.MILLISECONDS, TimeUnit.SECONDS))
 }

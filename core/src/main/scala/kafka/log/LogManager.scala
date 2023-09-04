@@ -484,34 +484,43 @@ class LogManager(logDirs: Seq[File],
    */
   def startup(): Unit = {
     /* Schedule the cleanup task to delete old logs */
+    // 后台线程池不为空的情况下进行日志管理后台工作的启动，这里会启动五个定时调度的任务。
     if (scheduler != null) {
       info("Starting log cleanup with a period of %d ms.".format(retentionCheckMs))
+      // 启动 kafka-log-retention 周期性任务，遍历所有的log，对过期或过大的日志文件执行清理工作。
       scheduler.schedule("kafka-log-retention",
-                         cleanupLogs _,
-                         delay = InitialTaskDelayMs,
-                         period = retentionCheckMs,
+                         cleanupLogs _, // 定时执行的方法
+                         delay = InitialTaskDelayMs, // 启动之后30s开始定时调度
+                         period = retentionCheckMs, // log.retention.check.interval.ms 默认为5分钟。
                          TimeUnit.MILLISECONDS)
       info("Starting log flusher with a default period of %d ms.".format(flushCheckMs))
+      // 启动 kafka-log-flusher 周期性任务，对日志文件执行刷盘操作，定时把内存中的数据刷到磁盘中。
       scheduler.schedule("kafka-log-flusher",
-                         flushDirtyLogs _,
-                         delay = InitialTaskDelayMs,
-                         period = flushCheckMs,
+                         flushDirtyLogs _, // 定时执行的方法
+                         delay = InitialTaskDelayMs,  // 启动之后30s开始定时调度
+                         period = flushCheckMs, // log.flush.scheduler.interal.ms 默认值为Long.MaxValue。也就是说默认不刷盘，操作系统自己刷盘。
                          TimeUnit.MILLISECONDS)
+      // 启动 kafka-recovery-point-checkpoint 周期性任务，更新 kafka-recovery-point-checkpoint 文件。
+      // 向路径中写入当前的恢复点，避免在重启的时候重新恢复全部数据。
       scheduler.schedule("kafka-recovery-point-checkpoint",
-                         checkpointLogRecoveryOffsets _,
-                         delay = InitialTaskDelayMs,
-                         period = flushRecoveryOffsetCheckpointMs,
+                         checkpointLogRecoveryOffsets _, // 定时执行的方法
+                         delay = InitialTaskDelayMs, // 启动之后30s开始定时调度
+                         period = flushRecoveryOffsetCheckpointMs, // log.flush.offset.checkpoint.interval.ms 默认为1分钟。
                          TimeUnit.MILLISECONDS)
+      // 启动 kafka-log-start-offset-checkpoint 周期性任务，更新 kafka-log-start-offset-checkpoint 文件。
+      // 向日志目录写入当前存储日志中的 start offset，避免读到已经被删除的日志。
       scheduler.schedule("kafka-log-start-offset-checkpoint",
-                         checkpointLogStartOffsets _,
-                         delay = InitialTaskDelayMs,
-                         period = flushStartOffsetCheckpointMs,
+                         checkpointLogStartOffsets _, // 定时执行的方法
+                         delay = InitialTaskDelayMs, // 启动之后30s开始定时调度
+                         period = flushStartOffsetCheckpointMs, // log.flush.start.offset.checkpoint.interval.ms 默认值为1分钟
                          TimeUnit.MILLISECONDS)
+      // 启动 kafka-delete-logs 周期性任务，清理已经被标记为删除的日志。
       scheduler.schedule("kafka-delete-logs", // will be rescheduled after each delete logs with a dynamic period
-                         deleteLogs _,
-                         delay = InitialTaskDelayMs,
+                         deleteLogs _, // 定时执行的方法
+                         delay = InitialTaskDelayMs, // 启动之后30s开始定时调度
                          unit = TimeUnit.MILLISECONDS)
     }
+    // 日志清理压缩线程启动
     if (cleanerConfig.enableCleaner)
       cleaner.startup()
   }
