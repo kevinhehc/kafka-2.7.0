@@ -73,6 +73,13 @@ class LogSegment private[log] (val log: FileRecords,
   def shouldRoll(rollParams: RollParams): Boolean = {
     // 计算多久没有新建日志分段文件了。
     val reachedRollMs = timeWaitedForRoll(rollParams.now, rollParams.maxTimestampInMessages) > rollParams.maxSegmentMs - rollJitterMs
+
+    // 1、如果加上现在消息的大小这个 segment 超过 1G，就需要新建一个 segment。
+    // 2、日志段有数据，并且距离上次创建日志段的时间达到了一个阈值（log.roll.hours默认7天）。
+    // 3、索引文件满了（默认10m）log.index.size.max.bytes。
+    // 4、时间索引文件满了（默认10m）。
+    // 5、根据最大的 offset
+
     // 需要新建日志段的条件
     size > rollParams.maxSegmentBytes - rollParams.messagesSize ||
       // 当前日志段大小超过了阈值

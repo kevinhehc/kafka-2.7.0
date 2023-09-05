@@ -50,6 +50,15 @@ import org.apache.kafka.common.errors.InvalidOffsetException
  * storage format.
  */
 // Avoid shadowing mutable `file` in AbstractIndex
+// file 索引文件：每个索引对象在磁盘上都对应了一个索引文件。
+// baseOffset 起始位移值：对应日志文件中第一个消息的offset。
+// maxIndexSize 索引文件最大字节数：它控制索引文件的最大长度，这里为 -1。
+// writable 索引文件打开方式：这里为 true 表示以读写方式打开。
+// mmap：用来操作索引文件的 MappedByteBuffer。
+// lock：ReentrantLock 对象，在对 mmap 进行操作时，需要加锁保护。
+// entries：当前索引文件中的索引项个数。
+// maxEntries：当前索引文件中最多能够保存的索引项个数。
+// lastOffset：保存最后一个索引项的 offset。
 class OffsetIndex(_file: File, baseOffset: Long, maxIndexSize: Int = -1, writable: Boolean = true)
     extends AbstractIndex(_file, baseOffset, maxIndexSize, writable) {
   import OffsetIndex._
@@ -86,9 +95,13 @@ class OffsetIndex(_file: File, baseOffset: Long, maxIndexSize: Int = -1, writabl
    *         the pair (baseOffset, 0) is returned.
    */
   def lookup(targetOffset: Long): OffsetPosition = {
+    // 尝试加锁
     maybeLock(lock) {
+      // 用私有变量做一个 mmap 的镜像，防止有新的索引进来，影响一致性。
       val idx = mmap.duplicate
+      // 使用了改进版的二分查找算法寻找对应的槽位
       val slot = largestLowerBoundSlotFor(idx, targetOffset, IndexSearchType.KEY)
+      // 如果没找到，返回一个空的位置，即物理文件位置从0开始，表示从头读日志文件，否则返回 slot 槽对应的索引项
       if(slot == -1)
         OffsetPosition(baseOffset, 0)
       else
@@ -116,7 +129,11 @@ class OffsetIndex(_file: File, baseOffset: Long, maxIndexSize: Int = -1, writabl
 
   private def physical(buffer: ByteBuffer, n: Int): Int = buffer.getInt(n * entrySize + 4)
 
+  // 查找指定索引项 n 表示第几个索引项
   override protected def parseEntry(buffer: ByteBuffer, n: Int): OffsetPosition = {
+    // 转换真实的 Offset
+    // 计算绝对位移值 baseOffset + relativeOffset(buffer, n)
+    // 计算物理位置 physical(buffer, n)
     OffsetPosition(baseOffset + relativeOffset(buffer, n), physical(buffer, n))
   }
 
@@ -140,21 +157,31 @@ class OffsetIndex(_file: File, baseOffset: Long, maxIndexSize: Int = -1, writabl
    */
   def append(offset: Long, position: Int): Unit = {
     inLock(lock) {
+      // 判断索引文件未写满
       require(!isFull, "Attempt to append to a full index (size = " + _entries + ").")
+      // 必须满足以下条件之一才允许写入索引项：
+      // 条件1：当前索引文件为空
+      // 条件2：要写入的位移大于当前所有已写入的索引项的位移 —— Kafka 规定索引项中的位移值必须是单调增加的
       if (_entries == 0 || offset > _lastOffset) {
         trace(s"Adding index entry $offset => $position to ${file.getAbsolutePath}")
+        // 向 mmap 中写入相对位移值
         mmap.putInt(relativeOffset(offset))
+        // 向 mmap 中写入物理位置信息
         mmap.putInt(position)
+        // 更新其他元数据统计信息，当前索引项计数器_entries 和当前索引项最新位移值_lastOffset
         _entries += 1
         _lastOffset = offset
+        // 执行校验。写入的索引项格式必须符合要求，即索引项个数*单个索引项占用字节数匹配当前文件物理大小，否则说明文件已损坏
         require(_entries * entrySize == mmap.position(), s"$entries entries but file position in index is ${mmap.position()}.")
       } else {
+        // 如果第 2 步中两个条件都不满足，不能执行写入索引项操作，抛出异常
         throw new InvalidOffsetException(s"Attempt to append an offset ($offset) to position $entries no larger than" +
           s" the last offset appended (${_lastOffset}) to ${file.getAbsolutePath}.")
       }
     }
   }
 
+  // 覆写 AbstractIndex 类的 truncate 方法，将索引文件截断至第一条索引记录之前，即清空索引文件。
   override def truncate() = truncateToEntries(0)
 
   override def truncateTo(offset: Long): Unit = {
