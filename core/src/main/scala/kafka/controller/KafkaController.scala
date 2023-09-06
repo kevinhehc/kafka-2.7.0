@@ -520,7 +520,9 @@ class KafkaController(val config: KafkaConfig,
     unregisterBrokerModificationsHandler(brokerModificationsHandlers.keySet)
 
     // shutdown leader rebalance scheduler
+    // 关闭 Kafka 线程调度器，其实就是取消定期的 Leader 重选举
     kafkaScheduler.shutdown()
+    // 将统计字段全部清零
     offlinePartitionCount = 0
     preferredReplicaImbalanceCount = 0
     globalTopicCount = 0
@@ -531,21 +533,31 @@ class KafkaController(val config: KafkaConfig,
     ineligibleReplicasToDeleteCount = 0
 
     // stop token expiry check scheduler
+    // 关闭 Token 过期检查调度器
     if (tokenCleanScheduler.isStarted)
       tokenCleanScheduler.shutdown()
 
     // de-register partition ISR listener for on-going partition reassignment task
+    // 取消分区重分配监听器的注册
     unregisterPartitionReassignmentIsrChangeHandlers()
     // shutdown partition state machine
+    // 关闭分区状态机
     partitionStateMachine.shutdown()
+    // 取消主题变更监听器的注册
     zkClient.unregisterZNodeChildChangeHandler(topicChangeHandler.path)
+    // 取消分区变更监听器的注册
     unregisterPartitionModificationsHandlers(partitionModificationsHandlers.keys.toSeq)
+    // 取消主题删除监听器的注册
     zkClient.unregisterZNodeChildChangeHandler(topicDeletionHandler.path)
     // shutdown replica state machine
+    // 关闭副本状态机
     replicaStateMachine.shutdown()
+    // 取消 Broker 变更监听器的注册
     zkClient.unregisterZNodeChildChangeHandler(brokerChangeHandler.path)
 
+    // 关闭 Controller 通道管理器
     controllerChannelManager.shutdown()
+    // 清空集群元数据
     controllerContext.resetContext()
 
     info("Resigned")
@@ -637,8 +649,11 @@ class KafkaController(val config: KafkaConfig,
     }
   }
 
+  // 用于取消指定失效 broker 的 broker-modifications 监听器
   private def unregisterBrokerModificationsHandler(brokerIds: Iterable[Int]): Unit = {
+    // 打印日志，记录要注销的 broker ID 列表
     debug(s"Unregister BrokerModifications handler for $brokerIds")
+    // 遍历所有要注销的 broker，从 brokerModificationsHandlers 中移除对应的监听器，并取消注册对应的 ZooKeeper 节点变更通知
     brokerIds.foreach { brokerId =>
       brokerModificationsHandlers.remove(brokerId).foreach(handler => zkClient.unregisterZNodeChangeHandler(handler.path))
     }
@@ -1563,27 +1578,35 @@ class KafkaController(val config: KafkaConfig,
   }
 
   private def maybeResign(): Unit = {
+    // 判断该 Broker 之前是否是 Controller
     val wasActiveBeforeChange = isActive
+    // 注册 ControllerChangeHandler 监听器
     zkClient.registerZNodeChangeHandlerAndCheckExistence(controllerChangeHandler)
+    // 获取当前集群 Controller 所在的 Broker Id，如果没有 Controller 则返回-1
     activeControllerId = zkClient.getControllerId.getOrElse(-1)
+    // 如果该 Broker 之前是 Controller 但现在不是了，则执行卸任操作
     if (wasActiveBeforeChange && !isActive) {
+      // 卸任操作
       onControllerResignation()
     }
   }
 
   private def elect(): Unit = {
+    // 获取当前 Controller 所在 Broker 的序号，如果 Controller 不存在，返回 -1
     activeControllerId = zkClient.getControllerId.getOrElse(-1)
     /*
      * We can get here during the initial startup and the handleDeleted ZK callback. Because of the potential race condition,
      * it's possible that the controller has already been elected when we get here. This check will prevent the following
      * createEphemeralPath method from getting into an infinite loop if this broker is already the controller.
      */
+    // 如果当前 Controller 已经选出来了，直接返回即可
     if (activeControllerId != -1) {
       debug(s"Broker $activeControllerId has been elected as the controller, so stopping the election process.")
       return
     }
 
     try {
+      // 注册Controller相关信息，主要是创建 /controller 节点
       val (epoch, epochZkVersion) = zkClient.registerControllerAndIncrementControllerEpoch(config.brokerId)
       controllerContext.epoch = epoch
       controllerContext.epochZkVersion = epochZkVersion
@@ -1592,9 +1615,11 @@ class KafkaController(val config: KafkaConfig,
       info(s"${config.brokerId} successfully elected as the controller. Epoch incremented to ${controllerContext.epoch} " +
         s"and epoch zk version is now ${controllerContext.epochZkVersion}")
 
+      // 执行当选 Controller 的后续逻辑
       onControllerFailover()
     } catch {
       case e: ControllerMovedException =>
+        // 执行卸任操作
         maybeResign()
 
         if (activeControllerId != -1)
@@ -1719,20 +1744,30 @@ class KafkaController(val config: KafkaConfig,
   }
 
   private def processTopicChange(): Unit = {
+    // 如果非 Contorller，直接返回
     if (!isActive) return
+    // 从 zk 的 /brokers/topics 节点中获取全量 topic 列表，
     val topics = zkClient.getAllTopicsInCluster(true)
+    // 找出新增的 topic
     val newTopics = topics -- controllerContext.allTopics
+    // 找出删除的 topic
     val deletedTopics = controllerContext.allTopics.diff(topics)
+    // 更新 Controller 元数据
     controllerContext.setAllTopics(topics)
 
+    // 注册 partition 相关的 hook
     registerPartitionModificationsHandlers(newTopics.toSeq)
+    // 获取新 topic 的 partition replica 分配
     val addedPartitionReplicaAssignment = zkClient.getFullReplicaAssignmentForTopics(newTopics)
+    // 删除不再存在的 topic
     deletedTopics.foreach(controllerContext.removeTopic)
+    // 更新新 topic 的 partition replica 分配
     addedPartitionReplicaAssignment.foreach {
       case (topicAndPartition, newReplicaAssignment) => controllerContext.updatePartitionFullReplicaAssignment(topicAndPartition, newReplicaAssignment)
     }
     info(s"New topics: [$newTopics], deleted topics: [$deletedTopics], new partition replica assignment " +
       s"[$addedPartitionReplicaAssignment]")
+    // 如果有新的 partition 创建，则执行 onNewPartitionCreation 方法
     if (addedPartitionReplicaAssignment.nonEmpty)
       onNewPartitionCreation(addedPartitionReplicaAssignment.keySet)
   }

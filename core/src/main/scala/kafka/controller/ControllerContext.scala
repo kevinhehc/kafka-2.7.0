@@ -160,11 +160,15 @@ class ControllerContext {
   }
 
   def allPartitions: Set[TopicPartition] = {
+    // 遍历 partitionAssignments，返回处理后的集合
     partitionAssignments.flatMap {
+      // 对于每一对 (topic, topicReplicaAssignment)，都遍历它的值 topicReplicaAssignment，返回 TopicPartition 实例
       case (topic, topicReplicaAssignment) => topicReplicaAssignment.map {
+        // 对于每个 (partition, _)，都构造一个新的 TopicPartition 实例，表示主题和分区
         case (partition, _) => new TopicPartition(topic, partition)
       }
     }.toSet
+    // 最后将处理后的 TopicPartition 实例集合转换为 Set 集合并返回。
   }
 
   def setLiveBrokers(brokerAndEpochs: Map[Broker, Long]): Unit = {
@@ -172,18 +176,26 @@ class ControllerContext {
     addLiveBrokers(brokerAndEpochs)
   }
 
+  // 清空存活 broker 信息
   private def clearLiveBrokers(): Unit = {
+    // 清空 liveBrokers 集合
     liveBrokers.clear()
+    // 清空 liveBrokerEpochs 集合
     liveBrokerEpochs.clear()
   }
 
+  // 添加存活 broker 信息
   def addLiveBrokers(brokerAndEpochs: Map[Broker, Long]): Unit = {
+    // 将每个 Broker 以及其对应的 brokerEpoch 添加到 liveBrokers 和 liveBrokerEpochs 集合中
     liveBrokers ++= brokerAndEpochs.keySet
     liveBrokerEpochs ++= brokerAndEpochs.map { case (broker, brokerEpoch) => (broker.id, brokerEpoch) }
   }
 
+  // 移除指定 broker 的存活信息
   def removeLiveBrokers(brokerIds: Set[Int]): Unit = {
+    // 从 liveBrokers 中移除被删除的 broker
     liveBrokers --= liveBrokers.filter(broker => brokerIds.contains(broker.id))
+    // 从 liveBrokerEpochs 中移除指定的 broker ID
     liveBrokerEpochs --= brokerIds
   }
 
@@ -365,13 +377,19 @@ class ControllerContext {
     updatePartitionStateMetrics(partition, currentState, targetState)
   }
 
-  private def updatePartitionStateMetrics(partition: TopicPartition,
-                                          currentState: PartitionState,
-                                          targetState: PartitionState): Unit = {
+  // 更新 offlinePartitionCount 元数据
+  private def updatePartitionStateMetrics(partition: TopicPartition, // 分区信息
+                                          currentState: PartitionState, // 分区当前状态
+                                          targetState: PartitionState): Unit = { // 分区目标状态
+    // 如果该主题当前并未处于删除中状态
     if (!isTopicDeletionInProgress(partition.topic)) {
+      // 判断是否要将该主题分区状态转换到离线状态，如果当前状态非 OfflinePartition 且目标状态是离线状态
       if (currentState != OfflinePartition && targetState == OfflinePartition) {
+        // 累加
         offlinePartitionCount = offlinePartitionCount + 1
+        // 判断是否要将该主题分区状态转换到非离线状态，如果当前状态已经是离线状态且目标状态非离线状态
       } else if (currentState == OfflinePartition && targetState != OfflinePartition) {
+        // 递减
         offlinePartitionCount = offlinePartitionCount - 1
       }
     }
