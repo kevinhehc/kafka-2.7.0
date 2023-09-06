@@ -97,26 +97,37 @@ class ControllerChannelManager(controllerContext: ControllerContext,
     // be careful here. Maybe the startup() API has already started the request send thread
     brokerLock synchronized {
       if (!brokerStateInfo.contains(broker.id)) {
+        // 添加新的 Broker
         addNewBroker(broker)
+        // 启动请求发送线程
         startRequestSendThread(broker.id)
       }
     }
   }
 
+  // 删除 Broker
   def removeBroker(brokerId: Int): Unit = {
+    // 对 Broker 进行同步操作
     brokerLock synchronized {
+      // 删除已存在的 Broker
       removeExistingBroker(brokerStateInfo(brokerId))
     }
   }
 
   private def addNewBroker(broker: Broker): Unit = {
+    // 创建用于存储消息的队列
     val messageQueue = new LinkedBlockingQueue[QueueItem]
+    // 打印调试信息
     debug(s"Controller ${config.brokerId} trying to connect to broker ${broker.id}")
+    // 获取控制器与 Broker 之间的网络监听器名称和安全协议
     val controllerToBrokerListenerName = config.controlPlaneListenerName.getOrElse(config.interBrokerListenerName)
     val controllerToBrokerSecurityProtocol = config.controlPlaneSecurityProtocol.getOrElse(config.interBrokerSecurityProtocol)
+    // 构建与 Broker 的连接
     val brokerNode = broker.node(controllerToBrokerListenerName)
     val logContext = new LogContext(s"[Controller id=${config.brokerId}, targetBrokerId=${brokerNode.idString}] ")
+    // 构建网络客户端和可重配置的通道构建器
     val (networkClient, reconfigurableChannelBuilder) = {
+      // 创建通道构建器
       val channelBuilder = ChannelBuilders.clientChannelBuilder(
         controllerToBrokerSecurityProtocol,
         JaasContext.Type.SERVER,
@@ -127,12 +138,14 @@ class ControllerChannelManager(controllerContext: ControllerContext,
         config.saslInterBrokerHandshakeRequestEnable,
         logContext
       )
+      // 如果通道构建器支持重新配置，则将其添加到 Controller 的可重配置列表中
       val reconfigurableChannelBuilder = channelBuilder match {
         case reconfigurable: Reconfigurable =>
           config.addReconfigurable(reconfigurable)
           Some(reconfigurable)
         case _ => None
       }
+      // 创建网络选择器和网络客户端
       val selector = new Selector(
         NetworkReceive.UNLIMITED,
         Selector.NO_IDLE_TIMEOUT_MS,
@@ -164,11 +177,13 @@ class ControllerChannelManager(controllerContext: ControllerContext,
       )
       (networkClient, reconfigurableChannelBuilder)
     }
+    // 构建用于发送请求的线程名称
     val threadName = threadNamePrefix match {
       case None => s"Controller-${config.brokerId}-to-broker-${broker.id}-send-thread"
       case Some(name) => s"$name:Controller-${config.brokerId}-to-broker-${broker.id}-send-thread"
     }
 
+    // 构建请求发送线程，并设置为非守护线程
     val requestRateAndQueueTimeMetrics = newTimer(
       RequestRateAndQueueTimeMetricName, TimeUnit.MILLISECONDS, TimeUnit.SECONDS, brokerMetricTags(broker.id)
     )
@@ -177,25 +192,38 @@ class ControllerChannelManager(controllerContext: ControllerContext,
       brokerNode, config, time, requestRateAndQueueTimeMetrics, stateChangeLogger, threadName)
     requestThread.setDaemon(false)
 
+    // 创建队列大小指标
     val queueSizeGauge = newGauge(QueueSizeMetricName, () => messageQueue.size, brokerMetricTags(broker.id))
 
+    // 将 Broker 的相关信息存储到 brokerStateInfo 中
     brokerStateInfo.put(broker.id, ControllerBrokerStateInfo(networkClient, brokerNode, messageQueue,
       requestThread, queueSizeGauge, requestRateAndQueueTimeMetrics, reconfigurableChannelBuilder))
   }
 
   private def brokerMetricTags(brokerId: Int) = Map("broker-id" -> brokerId.toString)
 
+  //  删除已存在的 Broker
   private def removeExistingBroker(brokerState: ControllerBrokerStateInfo): Unit = {
     try {
       // Shutdown the RequestSendThread before closing the NetworkClient to avoid the concurrent use of the
       // non-threadsafe classes as described in KAFKA-4959.
       // The call to shutdownLatch.await() in ShutdownableThread.shutdown() serves as a synchronization barrier that
       // hands off the NetworkClient from the RequestSendThread to the ZkEventThread.
+      // 在关闭 NetworkClient 之前关闭 RequestSendThread 以避免在 KAFKA-4959 中描述的非线程安全类的并发使用。
+      // ShutdownableThread.shutdown()方法中的 shutdownLatch.await() 调用充当同步屏障，
+      // 它将NetworkClient 从 RequestSendThread 移交给了 ZkEventThread。
+
+      // 如果 Broker 状态具有可重配置通道构建器，则从配置中删除该构建器
       brokerState.reconfigurableChannelBuilder.foreach(config.removeReconfigurable)
+      // 关闭请求发送线程
       brokerState.requestSendThread.shutdown()
+      // 关闭NetworkClient
       brokerState.networkClient.close()
+      // 清空消息队列
       brokerState.messageQueue.clear()
+      // 删除指定 Broker 的队列大小指标和请求速率与队列时间指标
       removeMetric(QueueSizeMetricName, brokerMetricTags(brokerState.brokerNode.id))
+      // 从 Broker 状态信息中移除该 Broker
       removeMetric(RequestRateAndQueueTimeMetricName, brokerMetricTags(brokerState.brokerNode.id))
       brokerStateInfo.remove(brokerState.brokerNode.id)
     } catch {
@@ -204,8 +232,11 @@ class ControllerChannelManager(controllerContext: ControllerContext,
   }
 
   protected def startRequestSendThread(brokerId: Int): Unit = {
+    // 获取指定 brokerid 的请求发送线程
     val requestThread = brokerStateInfo(brokerId).requestSendThread
+    // 如果请求发送线程的状态为刚创建的，则启动线程
     if (requestThread.getState == Thread.State.NEW)
+    // 启动发送请求线程。
       requestThread.start()
   }
 }

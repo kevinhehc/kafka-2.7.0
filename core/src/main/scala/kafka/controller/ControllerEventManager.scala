@@ -118,18 +118,24 @@ class ControllerEventManager(controllerId: Int,
     logIdent = s"[ControllerEventThread controllerId=$controllerId] "
 
     override def doWork(): Unit = {
+      // 从事件队列中获取待处理的Controller事件，否则等待
       val dequeued = pollFromEventQueue()
       dequeued.event match {
+        // 如果是关闭线程事件，什么都不用做。关闭线程由外部来执行
         case ShutdownEventThread => // The shutting down of the thread has been initiated at this point. Ignore this event.
         case controllerEvent =>
           _state = controllerEvent.state
 
+          // 更新对应事件在队列中保存的时间
           eventQueueTimeHist.update(time.milliseconds() - dequeued.enqueueTimeMs)
 
           try {
+            // 定义一个事件处理函数，调用ControllerEventProcessor类的process()函数执行逻辑
             def process(): Unit = dequeued.process(processor)
 
+            // 处理事件，同时计算处理速
             rateAndTimeMetrics.get(state) match {
+              // 延迟调度
               case Some(timer) => timer.time { process() }
               case None => process()
             }
@@ -142,17 +148,20 @@ class ControllerEventManager(controllerId: Int,
     }
   }
 
+  // 从事件队列中获取待处理的Controller事件
   private def pollFromEventQueue(): QueuedEvent = {
     val count = eventQueueTimeHist.count()
     if (count != 0) {
       val event  = queue.poll(eventQueueTimeTimeoutMs, TimeUnit.MILLISECONDS)
       if (event == null) {
         eventQueueTimeHist.clear()
+        // 由于队列调用时take() 函数时阻塞的，直到队列中有事件才执行后续逻辑。
         queue.take()
       } else {
         event
       }
     } else {
+      // 由于队列调用时take() 函数时阻塞的，直到队列中有事件才执行后续逻辑。
       queue.take()
     }
   }

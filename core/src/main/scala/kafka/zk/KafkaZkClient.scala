@@ -1549,6 +1549,7 @@ class KafkaZkClient private[zk] (zooKeeperClient: ZooKeeperClient, isSecure: Boo
     * Pre-create top level paths in ZK if needed.
     */
   def createTopLevelPaths(): Unit = {
+    // 循环创建持久化路径
     ZkData.PersistentZkPaths.foreach(makeSurePersistentPathExists(_))
   }
 

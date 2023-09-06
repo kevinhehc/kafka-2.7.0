@@ -121,12 +121,18 @@ object KafkaServer {
  * Represents the lifecycle of a single Kafka broker. Handles all functionality required
  * to start up and shutdown a single Kafka node.
  */
+// config 配置信息
+// kafkaMetricsReporters 监控上报
 class KafkaServer(val config: KafkaConfig, time: Time = Time.SYSTEM, threadNamePrefix: Option[String] = None,
                   kafkaMetricsReporters: Seq[KafkaMetricsReporter] = List()) extends Logging with KafkaMetricsGroup {
+  //标识节点已经启动完成
   private val startupComplete = new AtomicBoolean(false)
+  //标识节点正在执行关闭操作
   private val isShuttingDown = new AtomicBoolean(false)
+  //标识节点正在执行启动操作
   private val isStartingUp = new AtomicBoolean(false)
 
+  //阻塞主线程等待 KafkaServer 的关闭
   private var shutdownLatch = new CountDownLatch(1)
 
   //properties for MetricsContext
@@ -135,46 +141,67 @@ class KafkaServer(val config: KafkaConfig, time: Time = Time.SYSTEM, threadNameP
   private val KAFKA_BROKER_ID: String = "kafka.broker.id"
 
 
+  //日志上下文
   private var logContext: LogContext = null
 
   var kafkaYammerMetrics: KafkaYammerMetrics = null
   var metrics: Metrics = null
 
+  //记录节点的当前状态
   val brokerState: BrokerState = new BrokerState
 
+  //API接口类，用于处理数据类请求
   var dataPlaneRequestProcessor: KafkaApis = null
+  //API接口，用于处理控制类请求
   var controlPlaneRequestProcessor: KafkaApis = null
 
+  //权限管理
   var authorizer: Option[Authorizer] = None
+  //启动socket，监听9092端口，等待接收客户端请求
   var socketServer: SocketServer = null
+  //数据类请求处理线程池
   var dataPlaneRequestHandlerPool: KafkaRequestHandlerPool = null
+  //命令类处理线程池
   var controlPlaneRequestHandlerPool: KafkaRequestHandlerPool = null
 
+  //日志管理器
   var logDirFailureChannel: LogDirFailureChannel = null
   var logManager: LogManager = null
 
+  //副本管理器
   var replicaManager: ReplicaManager = null
+  //topic增删管理器
   var adminManager: AdminManager = null
+  //token管理器
   var tokenManager: DelegationTokenManager = null
 
+  //动态配置管理器
   var dynamicConfigHandlers: Map[String, ConfigHandler] = null
   var dynamicConfigManager: DynamicConfigManager = null
   var credentialProvider: CredentialProvider = null
   var tokenCache: DelegationTokenCache = null
 
+  //分组协调器
   var groupCoordinator: GroupCoordinator = null
 
+  //事务协调器
   var transactionCoordinator: TransactionCoordinator = null
 
+  //集群控制器
   var kafkaController: KafkaController = null
 
   var brokerToControllerChannelManager: BrokerToControllerChannelManager = null
 
+  //定时任务调度器
   var kafkaScheduler: KafkaScheduler = null
 
+  //集群分区状态信息缓存
   var metadataCache: MetadataCache = null
+
+  //配额管理器
   var quotaManagers: QuotaFactory.QuotaManagers = null
 
+  //zk客户端配置
   val zkClientConfig: ZKClientConfig = KafkaServer.zkClientConfigFromKafkaConfig(config).getOrElse(new ZKClientConfig())
   private var _zkClient: KafkaZkClient = null
 
@@ -219,17 +246,21 @@ class KafkaServer(val config: KafkaConfig, time: Time = Time.SYSTEM, threadNameP
     try {
       info("starting")
 
+      // 是否已关闭
       if (isShuttingDown.get)
         throw new IllegalStateException("Kafka server is still shutting down, cannot re-start!")
 
+      // 是否已启动
       if (startupComplete.get)
         return
 
+      // 是否可以启动
       val canStartup = isStartingUp.compareAndSet(false, true)
       if (canStartup) {
         brokerState.newState(Starting)
 
         /* setup zookeeper */
+        // 连接ZK，并创建根节点
         initZkClient(time)
 
         /* initialize features */
@@ -239,10 +270,13 @@ class KafkaServer(val config: KafkaConfig, time: Time = Time.SYSTEM, threadNameP
         }
 
         /* Get or create cluster_id */
+        // 从ZK获取或创建集群id，规则：UUID的mostSigBits、leastSigBits组合转base64
         _clusterId = getOrGenerateClusterId(zkClient)
         info(s"Cluster ID = $clusterId")
 
         /* load metadata */
+        // 获取brokerId及log存储路径，brokerId通过zk生成或者server.properties配置broker.id
+        // 规则：/brokers/seqid的version值 + maxReservedBrokerId（默认1000），保证唯一性
         val (preloadedBrokerMetadataCheckpoint, initialOfflineDirs) = getBrokerMetadataAndOfflineDirs
 
         /* check cluster id */
@@ -254,10 +288,12 @@ class KafkaServer(val config: KafkaConfig, time: Time = Time.SYSTEM, threadNameP
         /* generate brokerId */
         config.brokerId = getOrGenerateBrokerId(preloadedBrokerMetadataCheckpoint)
         logContext = new LogContext(s"[KafkaServer id=${config.brokerId}] ")
+        // 配置logger
         this.logIdent = logContext.logPrefix
 
         // initialize dynamic broker configs from ZooKeeper. Any updates made after this will be
         // applied after DynamicConfigManager starts.
+        // 初始化AdminZkClient，支持动态修改配置
         config.dynamicConfig.initialize(zkClient)
 
         /* start scheduler */
@@ -282,9 +318,11 @@ class KafkaServer(val config: KafkaConfig, time: Time = Time.SYSTEM, threadNameP
         /* register broker metrics */
         _brokerTopicStats = new BrokerTopicStats
 
+        // 初始化配额管理器
         quotaManagers = QuotaFactory.instantiate(config, metrics, time, threadNamePrefix.getOrElse(""))
         notifyClusterListeners(kafkaMetricsReporters ++ metrics.reporters.asScala)
 
+        // 用于保证kafka-log数据目录的存在
         logDirFailureChannel = new LogDirFailureChannel(config.logDirs.size)
 
         /* start log manager */
@@ -303,38 +341,47 @@ class KafkaServer(val config: KafkaConfig, time: Time = Time.SYSTEM, threadNameP
         // Create and start the socket server acceptor threads so that the bound port is known.
         // Delay starting processors until the end of the initialization sequence to ensure
         // that credentials have been loaded before processing authentications.
+        // 启动socket，监听9092端口，等待接收客户端请求
         socketServer = new SocketServer(config, metrics, time, credentialProvider)
         socketServer.startup(startProcessingRequests = false)
 
         /* start replica manager */
         brokerToControllerChannelManager = new BrokerToControllerChannelManagerImpl(metadataCache, time, metrics, config, threadNamePrefix)
+        // 启动副本管理器，高可用相关
         replicaManager = createReplicaManager(isShuttingDown)
         replicaManager.startup()
         brokerToControllerChannelManager.start()
 
+        // 将broker信息注册到ZK上
         val brokerInfo = createBrokerInfo
         val brokerEpoch = zkClient.registerBroker(brokerInfo)
 
         // Now that the broker is successfully registered, checkpoint its metadata
+        // 校验 broker 信息
         checkpointBrokerMetadata(BrokerMetadata(config.brokerId, Some(clusterId)))
 
         /* start token manager */
+        // 启动 token 管理器
         tokenManager = new DelegationTokenManager(config, tokenCache, time , zkClient)
         tokenManager.startup()
 
         /* start kafka controller */
+        // 启动Kafka控制器，只有 Leader 会与ZK建连
         kafkaController = new KafkaController(config, zkClient, time, metrics, brokerInfo, brokerEpoch, tokenManager, brokerFeatures, featureCache, threadNamePrefix)
         kafkaController.startup()
 
+        // admin管理器
         adminManager = new AdminManager(config, metrics, metadataCache, zkClient)
 
         /* start group coordinator */
         // Hardcode Time.SYSTEM for now as some Streams tests fail otherwise, it would be good to fix the underlying issue
+        // 启动集群群组协调器
         groupCoordinator = GroupCoordinator(config, zkClient, replicaManager, Time.SYSTEM, metrics)
         groupCoordinator.startup()
 
         /* start transaction coordinator, with a separate background thread scheduler for transaction expiration and log loading */
         // Hardcode Time.SYSTEM for now as some Streams tests fail otherwise, it would be good to fix the underlying issue
+        // 启动事务协调器
         transactionCoordinator = TransactionCoordinator(config, replicaManager, new KafkaScheduler(threads = 1, threadNamePrefix = "transaction-log-manager-"), zkClient, metrics, metadataCache, Time.SYSTEM)
         transactionCoordinator.startup()
 
@@ -352,15 +399,18 @@ class KafkaServer(val config: KafkaConfig, time: Time = Time.SYSTEM, threadNameP
             }.toMap
         }
 
+        // 创建拉取管理器
         val fetchManager = new FetchManager(Time.SYSTEM,
           new FetchSessionCache(config.maxIncrementalFetchSessionCacheSlots,
             KafkaServer.MIN_INCREMENTAL_FETCH_SESSION_EVICTION_MS))
 
         /* start processing requests */
+        // 初始化数据类请求的KafkaApis，负责数据类请求逻辑处理
         dataPlaneRequestProcessor = new KafkaApis(socketServer.dataPlaneRequestChannel, replicaManager, adminManager, groupCoordinator, transactionCoordinator,
           kafkaController, zkClient, config.brokerId, config, metadataCache, metrics, authorizer, quotaManagers,
           fetchManager, brokerTopicStats, clusterId, time, tokenManager, brokerFeatures, featureCache)
 
+        // 初始化数据类请求处理的线程池
         dataPlaneRequestHandlerPool = new KafkaRequestHandlerPool(config.brokerId, socketServer.dataPlaneRequestChannel, dataPlaneRequestProcessor, time,
           config.numIoThreads, s"${SocketServer.DataPlaneMetricPrefix}RequestHandlerAvgIdlePercent", SocketServer.DataPlaneThreadPrefix)
 
@@ -369,6 +419,7 @@ class KafkaServer(val config: KafkaConfig, time: Time = Time.SYSTEM, threadNameP
             kafkaController, zkClient, config.brokerId, config, metadataCache, metrics, authorizer, quotaManagers,
             fetchManager, brokerTopicStats, clusterId, time, tokenManager, brokerFeatures, featureCache)
 
+          // 初始化控制类请求的线程池
           controlPlaneRequestHandlerPool = new KafkaRequestHandlerPool(config.brokerId, socketServer.controlPlaneRequestChannelOpt.get, controlPlaneRequestProcessor, time,
             1, s"${SocketServer.ControlPlaneMetricPrefix}RequestHandlerAvgIdlePercent", SocketServer.ControlPlaneThreadPrefix)
         }
@@ -385,11 +436,14 @@ class KafkaServer(val config: KafkaConfig, time: Time = Time.SYSTEM, threadNameP
                                                            ConfigType.Broker -> new BrokerConfigHandler(config, quotaManagers))
 
         // Create the config manager. start listening to notifications
+        // 启动动态配置处理器
         dynamicConfigManager = new DynamicConfigManager(zkClient, dynamicConfigHandlers)
         dynamicConfigManager.startup()
 
+        // 启动请求处理线程
         socketServer.startProcessingRequests(authorizerFutures)
 
+        // 更新broker状态
         brokerState.newState(RunningAsBroker)
         shutdownLatch = new CountDownLatch(1)
         startupComplete.set(true)
@@ -439,35 +493,45 @@ class KafkaServer(val config: KafkaConfig, time: Time = Time.SYSTEM, threadNameP
   }
 
   private def initZkClient(time: Time): Unit = {
+    // 输出连接ZooKeeper信息
     info(s"Connecting to zookeeper on ${config.zkConnect}")
 
+    // 定义创建ZooKeeper客户端的方法
     def createZkClient(zkConnect: String, isSecure: Boolean) = {
+      // 根据给定的信息创建KafkaZkClient实例
       KafkaZkClient(zkConnect, isSecure, config.zkSessionTimeoutMs, config.zkConnectionTimeoutMs,
         config.zkMaxInFlightRequests, time, name = Some("Kafka server"), zkClientConfig = Some(zkClientConfig))
     }
 
+    // 检查配置信息中是否包含chroot，并获取其值
     val chrootIndex = config.zkConnect.indexOf("/")
     val chrootOption = {
       if (chrootIndex > 0) Some(config.zkConnect.substring(chrootIndex))
       else None
     }
 
+    // 获取是否启用了安全ACL、是否启用了ZooKeeper安全模式的标志
     val secureAclsEnabled = config.zkEnableSecureAcls
     val isZkSecurityEnabled = JaasUtils.isZkSaslEnabled() || KafkaConfig.zkTlsClientAuthEnabled(zkClientConfig)
 
+    // 若启用了安全ACL，但未正确配置ZooKeeper客户端安全模式，则抛出异常
     if (secureAclsEnabled && !isZkSecurityEnabled)
       throw new java.lang.SecurityException(s"${KafkaConfig.ZkEnableSecureAclsProp} is true, but ZooKeeper client TLS configuration identifying at least $KafkaConfig.ZkSslClientEnableProp, $KafkaConfig.ZkClientCnxnSocketProp, and $KafkaConfig.ZkSslKeyStoreLocationProp was not present and the " +
         s"verification of the JAAS login file failed ${JaasUtils.zkSecuritySysConfigString}")
 
     // make sure chroot path exists
+    // 确保chroot路径存在
     chrootOption.foreach { chroot =>
+      // 创建连接ZooKeeper客户端的实例，并检查chroot路径是否存在，如果不存在，则尝试创建该路径
       val zkConnForChrootCreation = config.zkConnect.substring(0, chrootIndex)
       val zkClient = createZkClient(zkConnForChrootCreation, secureAclsEnabled)
+      // // 创建路径
       zkClient.makeSurePersistentPathExists(chroot)
       info(s"Created zookeeper path $chroot")
       zkClient.close()
     }
 
+    // 创建连接ZooKeeper客户端的实例，同时创建ZooKeeper的根路径
     _zkClient = createZkClient(config.zkConnect, secureAclsEnabled)
     _zkClient.createTopLevelPaths()
   }
@@ -837,17 +901,22 @@ class KafkaServer(val config: KafkaConfig, time: Time = Time.SYSTEM, threadNameP
    *
    * @return The brokerId.
    */
+  // 获取或者生成 Broker id
   private def getOrGenerateBrokerId(brokerMetadata: BrokerMetadata): Int = {
+    // 首先，获取配置文件中配置的 brokerId。
     val brokerId = config.brokerId
 
+    // 如果配置的 brokerId 大于等于 0 并且与存储在 meta.properties 文件中的 brokerId 不一致，则抛出异常。
     if (brokerId >= 0 && brokerMetadata.brokerId >= 0 && brokerMetadata.brokerId != brokerId)
       throw new InconsistentBrokerIdException(
         s"Configured broker.id $brokerId doesn't match stored broker.id ${brokerMetadata.brokerId} in meta.properties. " +
         s"If you moved your data, make sure your configured broker.id matches. " +
         s"If you intend to create a new broker, you should remove all data in your data directories (log.dirs).")
     else if (brokerMetadata.brokerId < 0 && brokerId < 0 && config.brokerIdGenerationEnable) // generate a new brokerId from Zookeeper
+    // 重新生成
       generateBrokerId
     else if (brokerMetadata.brokerId >= 0) // pick broker.id from meta.properties
+    // 已定义直接返回
       brokerMetadata.brokerId
     else
       brokerId
@@ -860,8 +929,11 @@ class KafkaServer(val config: KafkaConfig, time: Time = Time.SYSTEM, threadNameP
     */
   private def generateBrokerId: Int = {
     try {
+      // 使用 zkClient 对象从 ZooKeeper 中获取 Broker ID 序列号，其中 zkClient 是 ZkClient 类的实例。
+      // 将获取的序列号与配置文件中的 maxReservedBrokerId 相加，得到新的 Broker ID。
       zkClient.generateBrokerSequenceId() + config.maxReservedBrokerId
     } catch {
+      // 如果在获取序列号过程中抛出异常，则记录错误信息并抛出GenerateBrokerIdException异常。
       case e: Exception =>
         error("Failed to generate broker.id due to ", e)
         throw new GenerateBrokerIdException("Failed to generate broker.id", e)

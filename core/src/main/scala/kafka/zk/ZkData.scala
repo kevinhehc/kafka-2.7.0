@@ -931,15 +931,15 @@ object ZkData {
 
   // These are persistent ZK paths that should exist on kafka broker startup.
   val PersistentZkPaths = Seq(
-    ConsumerPathZNode.path, // old consumer path
-    BrokerIdsZNode.path,
-    TopicsZNode.path,
-    ConfigEntityChangeNotificationZNode.path,
-    DeleteTopicsZNode.path,
-    BrokerSequenceIdZNode.path,
-    IsrChangeNotificationZNode.path,
-    ProducerIdBlockZNode.path,
-    LogDirEventNotificationZNode.path
+    ConsumerPathZNode.path, // old consumer path // 旧消费者路径: /consumers
+    BrokerIdsZNode.path, // Broker的节点路径: /brokers/ids
+    TopicsZNode.path, // 主题的节点路径: /brokers/topics
+    ConfigEntityChangeNotificationZNode.path, // 配置实体更改通知的节点路径: /config/changes
+    DeleteTopicsZNode.path, // 删除主题的节点路径: /admin/delete_topics
+    BrokerSequenceIdZNode.path, // Broker 序列ID的节点路径: /brokers/seqid
+    IsrChangeNotificationZNode.path, // ISR 变更通知的节点路径: /isr_change_notification
+    ProducerIdBlockZNode.path,  // 生产者 ID 块的节点路径: /brokers/producerid_manager
+    LogDirEventNotificationZNode.path // 日志目录事件通知的节点路径:  /brokers/log_dir_event_notification
   ) ++ ConfigType.all.map(ConfigEntityTypeZNode.path)
 
   val SensitiveRootPaths = Seq(
