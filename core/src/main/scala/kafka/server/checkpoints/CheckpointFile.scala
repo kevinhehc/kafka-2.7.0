@@ -87,30 +87,40 @@ class CheckpointFile[T](val file: File,
   try Files.createFile(file.toPath) // create the file if it doesn't exist
   catch { case _: FileAlreadyExistsException => }
 
+  // 用于将接收到的数据写入到偏移量检查点文件中。
   def write(entries: Iterable[T]): Unit = {
+    // 获取该对象的锁，以保证写操作的互斥性和可见性。
     lock synchronized {
       try {
         // write to temp file and then swap with the existing file
+        // 创建一个文件输出流对象，用于写入偏移量检查点文件。
         val fileOutputStream = new FileOutputStream(tempPath.toFile)
+        // 创建一个带有缓冲的输出流，用于写入偏移量检查点文件的每一行。
         val writer = new BufferedWriter(new OutputStreamWriter(fileOutputStream, StandardCharsets.UTF_8))
         try {
+          // 将偏移量检查点文件的版本号写入到文件中。
           writer.write(version.toString)
           writer.newLine()
 
+          // 将待写入的数据条数写入到文件中。
           writer.write(entries.size.toString)
           writer.newLine()
 
+          // 对于待写入的每一个数据条目，循环使用 formatter 将其转化为文本格式，然后写入到文件中。
           entries.foreach { entry =>
             writer.write(formatter.toLine(entry))
             writer.newLine()
           }
 
+          // 将输出流中的缓存内容刷新到磁盘，确保数据被写入到磁盘中。
           writer.flush()
+          // 将文件所在的磁盘缓存与磁盘同步，以避免数据丢失。
           fileOutputStream.getFD().sync()
         } finally {
           writer.close()
         }
 
+        // 将临时文件原子地移动到偏移量检查点文件中，以保证文件的一致性和可用性。
         Utils.atomicMoveWithFallback(tempPath, path)
       } catch {
         case e: IOException =>

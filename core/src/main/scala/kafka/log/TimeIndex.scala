@@ -50,6 +50,13 @@ import org.apache.kafka.common.record.RecordBatch
  *
  */
 // Avoid shadowing mutable file in AbstractIndex
+// file 索引文件：每个索引对象在磁盘上都对应了一个索引文件。
+// baseOffset 起始位移值：对应日志文件中第一个消息的offset。
+// maxIndexSize 索引文件最大字节数：它控制索引文件的最大长度，这里为 -1。
+// writable 索引文件打开方式：这里为 true 表示以读写方式打开。
+// mmap：用来操作索引文件的 MappedByteBuffer。
+// lock：ReentrantLock 对象，在对 mmap 进行操作时，需要加锁保护。
+// lastEntries：当前索引文件中最后一个索引项。
 class TimeIndex(_file: File, baseOffset: Long, maxIndexSize: Int = -1, writable: Boolean = true)
     extends AbstractIndex(_file, baseOffset, maxIndexSize, writable) {
   import TimeIndex._
@@ -112,6 +119,7 @@ class TimeIndex(_file: File, baseOffset: Long, maxIndexSize: Int = -1, writable:
    */
   def maybeAppend(timestamp: Long, offset: Long, skipFullCheck: Boolean = false): Unit = {
     inLock(lock) {
+      // 如果索引文件已写满，抛出异常
       if (!skipFullCheck)
         require(!isFull, "Attempt to append to a full time index (size = " + _entries + ").")
       // We do not throw exception when the offset equals to the offset of last entry. That means we are trying
@@ -120,19 +128,25 @@ class TimeIndex(_file: File, baseOffset: Long, maxIndexSize: Int = -1, writable:
       // because that could happen in the following two scenarios:
       // 1. A log segment is closed.
       // 2. LogSegment.onBecomeInactiveSegment() is called when an active log segment is rolled.
+      // 确保索引单调增加性
       if (_entries != 0 && offset < lastEntry.offset)
         throw new InvalidOffsetException(s"Attempt to append an offset ($offset) to slot ${_entries} no larger than" +
           s" the last offset appended (${lastEntry.offset}) to ${file.getAbsolutePath}.")
+      // 确保时间戳的单调增加性
       if (_entries != 0 && timestamp < lastEntry.timestamp)
         throw new IllegalStateException(s"Attempt to append a timestamp ($timestamp) to slot ${_entries} no larger" +
           s" than the last timestamp appended (${lastEntry.timestamp}) to ${file.getAbsolutePath}.")
       // We only append to the time index when the timestamp is greater than the last inserted timestamp.
       // If all the messages are in message format v0, the timestamp will always be NoTimestamp. In that case, the time
       // index will be empty.
+      // 符合单调递增性
       if (timestamp > lastEntry.timestamp) {
         trace(s"Adding index entry $timestamp => $offset to ${file.getAbsolutePath}.")
+        // 向 mmap 写入时间戳
         mmap.putLong(timestamp)
+        // 向 mmap 写入相对位移值
         mmap.putInt(relativeOffset(offset))
+        // 更新其他元数据统计信息，当前索引项计数器 _entries 和 当前条目设置为最新的条目_lastEntry。
         _entries += 1
         _lastEntry = TimestampOffset(timestamp, offset)
         require(_entries * entrySize == mmap.position(), s"${_entries} entries but file position in index is ${mmap.position()}.")
@@ -159,6 +173,7 @@ class TimeIndex(_file: File, baseOffset: Long, maxIndexSize: Int = -1, writable:
     }
   }
 
+  // 覆写 AbstractIndex 类的 truncate 方法，将索引文件截断至第一条索引记录之前，即清空索引文件。
   override def truncate() = truncateToEntries(0)
 
   /**
@@ -199,11 +214,17 @@ class TimeIndex(_file: File, baseOffset: Long, maxIndexSize: Int = -1, writable:
   /**
    * Truncates index to a known number of entries.
    */
+  // 根据索引条目数截断索引文件
   private def truncateToEntries(entries: Int): Unit = {
+    // 使用锁确保线程安全。
     inLock(lock) {
+      // 将索引文件内存映射到指定大小。
       _entries = entries
+      // 将文件指针设置到索引区的末尾。
       mmap.position(_entries * entrySize)
+      // 更新索引文件中的 _lastOffset 字段，将其设置为当前索引中的最后一个条目的偏移量。
       _lastEntry = lastEntryFromIndexFile
+      // 记录日志。该方法的作用是根据指定的索引条目数截断索引文件，并更新相应的元数据信息。
       debug(s"Truncated index ${file.getAbsolutePath} to $entries entries; position is now ${mmap.position()} and last entry is now ${_lastEntry}")
     }
   }

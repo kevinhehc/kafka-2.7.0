@@ -671,9 +671,13 @@ class LogManager(logDirs: Seq[File],
    * to avoid recovering the whole log on startup.
    */
   def checkpointLogRecoveryOffsets(): Unit = {
+    // 获取所有主题分区的日志文件，将它们按照目录进行分组，存储在变量 logsByDirCached 中。
     val logsByDirCached = logsByDir
+    // 循环每个主题分区日志存储目录
     liveLogDirs.foreach { logDir =>
+      // 获取当前目录下的所有主题分区日志文件。
       val logsToCheckpoint = logsInDir(logsByDirCached, logDir)
+      // 检查点恢复偏移并清理快照文件。
       checkpointRecoveryOffsetsAndCleanSnapshotsInDir(logDir, logsToCheckpoint, logsToCheckpoint.values.toSeq)
     }
   }
@@ -682,9 +686,12 @@ class LogManager(logDirs: Seq[File],
    * Write out the current log start offset for all logs to a text file in the log directory
    * to avoid exposing data that have been deleted by DeleteRecordsRequest
    */
+  // 在指定目录中检查点各个主题分区的起始偏移量。
   def checkpointLogStartOffsets(): Unit = {
+    // 它缓存所有主题分区的日志文件，将它们按照目录进行分组，存储在变量 logsByDirCached 中
     val logsByDirCached = logsByDir
     liveLogDirs.foreach { logDir =>
+      // 它对于每个主题分区日志存储目录，调用 checkpointLogStartOffsetsInDir 方法，进行检查点操作
       checkpointLogStartOffsetsInDir(logDir, logsInDir(logsByDirCached, logDir))
     }
   }
@@ -709,17 +716,26 @@ class LogManager(logDirs: Seq[File],
    * @param logsToCheckpoint the logs to be checkpointed
    * @param logsToCleanSnapshot the logs whose snapshots will be cleaned
    */
+  // logDir 存储日志文件的目录
+  // logsToCheckpoint 需要进行检查点恢复偏移的日志文件
+  // logsToCleanSnapshot 需要清理快照文件的日志文件列表, toSeq 表示将日志文件从 Map 类型转换为序列类型
   private def checkpointRecoveryOffsetsAndCleanSnapshotsInDir(logDir: File, logsToCheckpoint: Map[TopicPartition, Log],
                                                               logsToCleanSnapshot: Seq[Log]): Unit = {
     try {
+      // 查找指定目录中的恢复检查点文件，并对其中的恢复偏移量进行更新。
       recoveryPointCheckpoints.get(logDir).foreach { checkpoint =>
+        // 构造一个 Map，将每个日志文件的主题分区和恢复偏移量配对。
         val recoveryOffsets = logsToCheckpoint.map { case (tp, log) => tp -> log.recoveryPoint }
+        // 将 recoveryOffsets 写入恢复检查点文件
         checkpoint.write(recoveryOffsets)
       }
+      // 循环遍历需要清理快照的日志文件列表，对其进行快照清理。每个日志文件会删除其恢复检查点后的快照文件。
       logsToCleanSnapshot.foreach(_.deleteSnapshotsAfterRecoveryPointCheckpoint())
     } catch {
+      // 如果磁盘发生错误，则记录错误信息。
       case e: KafkaStorageException =>
         error(s"Disk error while writing recovery offsets checkpoint in directory $logDir: ${e.getMessage}")
+      // 如果发生输入输出错误，则将该目录标记为离线，并且记录错误信息。
       case e: IOException =>
         logDirFailureChannel.maybeAddOfflineLogDir(logDir.getAbsolutePath,
           s"Disk error while writing recovery offsets checkpoint in directory $logDir: ${e.getMessage}", e)
@@ -732,15 +748,22 @@ class LogManager(logDirs: Seq[File],
    * @param logDir the directory in which logs are checkpointed
    * @param logsToCheckpoint the logs to be checkpointed
    */
+  // 在指定目录中检查点各个主题分区的起始偏移量，将它们写入检查点文件中。
   private def checkpointLogStartOffsetsInDir(logDir: File, logsToCheckpoint: Map[TopicPartition, Log]): Unit = {
     try {
+      // 首先查找指定目录中的起始偏移量检查点文件
       logStartOffsetCheckpoints.get(logDir).foreach { checkpoint =>
+        // 收集起始偏移量信息
         val logStartOffsets = logsToCheckpoint.collect {
+          // 这里构造一个 Map，将每个主题分区和其起始偏移量配对。每个主题分区的起始偏移量为其日志文件的 logStartOffset 属性，
+          // 但需要保证其不小于第一个日志段的基本偏移量
           case (tp, log) if log.logStartOffset > log.logSegments.head.baseOffset => tp -> log.logStartOffset
         }
+        // 将 logStartOffsets 写入起始偏移量检查点文件
         checkpoint.write(logStartOffsets)
       }
     } catch {
+      // 如果磁盘发生错误，则记录错误信息。
       case e: KafkaStorageException =>
         error(s"Disk error while writing log start offsets checkpoint in directory $logDir: ${e.getMessage}")
     }
@@ -941,21 +964,30 @@ class LogManager(logDirs: Seq[File],
    *  after the remaining time for the first log that is not deleted. If there are no more `logsToBeDeleted`,
    *  `deleteLogs` will be executed after `currentDefaultConfig.fileDeleteDelayMs`.
    */
+  // 异步删除已被标记为过时的日志文件
   private def deleteLogs(): Unit = {
     var nextDelayMs = 0L
     try {
+      // 计算即将删除的下一个日志文件距离当前时间的时间差，以确定下一次删除的时间间隔。
+      // 如果有日志文件需要被删除，则返回时间差，否则返回默认值 fileDeleteDelayMs。
       def nextDeleteDelayMs: Long = {
         if (!logsToBeDeleted.isEmpty) {
+          // 队列中取出
           val (_, scheduleTimeMs) = logsToBeDeleted.peek()
           scheduleTimeMs + currentDefaultConfig.fileDeleteDelayMs - time.milliseconds()
         } else
           currentDefaultConfig.fileDeleteDelayMs
       }
 
+      // 2、用于删除已被标记为过时的日志文件。在每次循环中，计算下一次删除日志文件的时间间隔 nextDelayMs，并且如果 nextDelayMs 大于零，
+      // 则方法会休眠相应的时间。然后从 logsToBeDeleted 队列中取出第一个即将删除的日志文件，并将其从队列中删除。
+      // 随后删除该日志文件，并打印日志信息
       while ({nextDelayMs = nextDeleteDelayMs; nextDelayMs <= 0}) {
+        // 从队列中取出
         val (removedLog, _) = logsToBeDeleted.take()
         if (removedLog != null) {
           try {
+            // 删除
             removedLog.delete()
             info(s"Deleted log for partition ${removedLog.topicPartition} in ${removedLog.dir.getAbsolutePath}.")
           } catch {
@@ -969,6 +1001,9 @@ class LogManager(logDirs: Seq[File],
         error(s"Exception in kafka-delete-logs thread.", e)
     } finally {
       try {
+        // 重新创建一个定时任务
+        // 使用定时调度器 scheduler 设置下一次删除操作的时间，并把方法自身作为回调函数进行调度。
+        // 如果定时调度器抛出了异常，则将该方法标记为已停止，会导致该方法不再执行，并打印异常信息。
         scheduler.schedule("kafka-delete-logs",
           deleteLogs _,
           delay = nextDelayMs,
@@ -1140,38 +1175,54 @@ class LogManager(logDirs: Seq[File],
    * Delete any eligible logs. Return the number of segments deleted.
    * Only consider logs that are not compacted.
    */
+  // 日志清除任务
   def cleanupLogs(): Unit = {
+    // 记录日志，表示开始清理操作
     debug("Beginning log cleanup...")
+    // 定义变量 total，用于存储删除的日志总数。
     var total = 0
+    // 变量 startMs，存储方法开始执行时的时间戳，用于记录操作所需时间
     val startMs = time.milliseconds
 
     // clean current logs.
+    // 初始化变量 deletableLogs，它是删除操作的目标，没有日志记录状态更改的话先返回 currentLogs，否则调用清理功能，并从中筛选出非压缩日志。
     val deletableLogs = {
       if (cleaner != null) {
         // prevent cleaner from working on same partitions when changing cleanup policy
+        // 1、先中断当前 topic-partition 下正在进行执行 cleaner 的线程
         cleaner.pauseCleaningForNonCompactedPartitions()
       } else {
+        // 2、过滤掉 cleanup.policy 配置的不是 delete 的 log
         currentLogs.filter {
           case (_, log) => !log.config.compact
         }
       }
     }
 
+    // 到这里了 deletableLogs 中 log 的 cleanup.policy 配置是 delete，开始进行删除
     try {
+      // 遍历被筛选的删除日志文件列表，执行以下操作。
       deletableLogs.foreach {
+        // 匹配主题和分区，并将其分配给变量 topicPartition 和 log。
         case (topicPartition, log) =>
+          // 记录日志，表示开始清理日志。
           debug(s"Garbage collecting '${log.name}'")
+          // 委托给 log.deleteOldSegments() 方法进行删除过期的 `logSegment`。
           total += log.deleteOldSegments()
 
+          // 获取分区主题的日志段，并将其分配给变量 futureLog。
           val futureLog = futureLogs.get(topicPartition)
           if (futureLog != null) {
             // clean future logs
             debug(s"Garbage collecting future log '${futureLog.name}'")
+            // 调用日志模块的方法 deleteOldSegments() 删除日志段。
             total += futureLog.deleteOldSegments()
           }
       }
     } finally {
       if (cleaner != null) {
+        // 如果存在清理功能，则唤醒清理线程。
+        // 如果在第 1 步中中断了 cleaner 线程，则在这里进行恢复。也就是说在 topic-partition 的同一时刻 只有一个 cleaner 对其进行清理
         cleaner.resumeCleaning(deletableLogs.map(_._1))
       }
     }
@@ -1231,11 +1282,15 @@ class LogManager(logDirs: Seq[File],
   private def flushDirtyLogs(): Unit = {
     debug("Checking for dirty logs to flush...")
 
+    // 遍历 currentLogs 和  futureLogs 集合
     for ((topicPartition, log) <- currentLogs.toList ++ futureLogs.toList) {
       try {
+        // 计算上一次 flush 的时间与当前时间差值
         val timeSinceLastFlush = time.milliseconds - log.lastFlushTime
         debug(s"Checking if flush is needed on ${topicPartition.topic} flush interval ${log.config.flushMs}" +
               s" last flushed ${log.lastFlushTime} time since last flush: $timeSinceLastFlush")
+        // 如果满足 flush.ms 配置的时间，则调用 flush 方法刷新到磁盘上
+        // 会把 [recoverPoint ~ LEO] 之间的消息数据刷新到磁盘上，并修改 recoverPoint 值
         if(timeSinceLastFlush >= log.config.flushMs)
           log.flush()
       } catch {

@@ -2342,23 +2342,36 @@ class Log(@volatile private var _dir: File, // 当前日志目录
    *
    * Return the minimum snapshots offset that was retained.
    */
+  // 用来删除某个日志文件的恢复点检查点后的快照
   def deleteSnapshotsAfterRecoveryPointCheckpoint(): Long = {
+    // 首先计算一个最小的偏移量，该偏移量以及其之前的快照文件将被保留
     val minOffsetToRetain = minSnapshotsOffsetToRetain
+    // 删除该文件中偏移量小于 minOffsetToRetain 的快照文件
     producerStateManager.deleteSnapshotsBefore(minOffsetToRetain)
+    // 返回 minOffsetToRetain
     minOffsetToRetain
   }
 
   // Visible for testing, see `deleteSnapshotsAfterRecoveryPointCheckpoint()` for details
+  // 获取保留快照的最小偏移量，即偏移量之前的快照文件将被保留
   private[log] def minSnapshotsOffsetToRetain: Long = {
+    // 获取日志文件的锁
     lock synchronized {
+      // 计算要保留的最小偏移量，该偏移量以及其之前的快照文件将被保留
       val twoSegmentsMinOffset = lowerSegment(activeSegment.baseOffset).getOrElse(activeSegment).baseOffset
       // Prefer segment base offset
+      // 计算恢复点偏移量
       val recoveryPointOffset = lowerSegment(recoveryPoint).map(_.baseOffset).getOrElse(recoveryPoint)
+      // 根据最小偏移量和恢复点计算一个偏移量。
       math.min(recoveryPointOffset, twoSegmentsMinOffset)
     }
   }
 
+  // 找到最近的存储上给定偏移量的日志段
+  // 接收一个偏移量并返回其之前的日志段。 它基于 segments，该变量是日志文件中所有日志段的列表，每个日志段具有开始和结束偏移量。
+  // 因为 segments 是按基础偏移排序的，所以可以使用 lowerEntry 方法来查找最近的日志段。
   private def lowerSegment(offset: Long): Option[LogSegment] =
+  //  lowerEntry 方法在 segments 列表中查找最后一个元素，其基础偏移量小于指定的偏移量。
     Option(segments.lowerEntry(offset)).map(_.getValue)
 
   /**
