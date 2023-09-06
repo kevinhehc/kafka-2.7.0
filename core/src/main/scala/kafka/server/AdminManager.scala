@@ -137,35 +137,43 @@ class AdminManager(val config: KafkaConfig,
     * Create topics and wait until the topics have been completely created.
     * The callback function will be triggered either when timeout, error or the topics are created.
     */
-  def createTopics(timeout: Int,
-                   validateOnly: Boolean,
-                   toCreate: Map[String, CreatableTopic],
-                   includeConfigsAndMetadata: Map[String, CreatableTopicResult],
-                   controllerMutationQuota: ControllerMutationQuota,
-                   responseCallback: Map[String, ApiError] => Unit): Unit = {
+  def createTopics(timeout: Int, // 创建主题的超时时间，单位为毫秒。
+                   validateOnly: Boolean, // 是否只进行验证而不实际创建主题。
+                   toCreate: Map[String, CreatableTopic], // 要创建的主题的Map，其中键是主题名称，值是CreatableTopic对象，表示主题的配置信息。
+                   includeConfigsAndMetadata: Map[String, CreatableTopicResult], // 用来包含主题的配置和元数据
+                   controllerMutationQuota: ControllerMutationQuota, // 控制器变更配额，在创建主题时用于记录控制器变更的数量。
+                   responseCallback: Map[String, ApiError] => Unit): Unit = { // 回调函数，用于在创建完成后接收结果。
 
     // 1. map over topics creating assignment and calling zookeeper
+    // 1、获取可用的 broker，用于获取分配者
     val brokers = metadataCache.getAliveBrokers.map { b => kafka.admin.BrokerMetadata(b.id, b.rack) }
+    // 遍历传入的要创建的主题，并创建相应主题
     val metadata = toCreate.values.map(topic =>
       try {
+        // 检查 Topic 是否存在，如果存在，则抛出 TopicExistsException。
         if (metadataCache.contains(topic.name))
           throw new TopicExistsException(s"Topic '${topic.name}' already exists.")
 
+        // 检查 Topic 配置中是否包含空值，如果包含，则抛出 InvalidRequestException。
         val nullConfigs = topic.configs.asScala.filter(_.value == null).map(_.name)
         if (nullConfigs.nonEmpty)
           throw new InvalidRequestException(s"Null value not supported for topic configs : ${nullConfigs.mkString(",")}")
 
+        // 如果同时设置了副本数/分区数和副本分配，则抛出异常
         if ((topic.numPartitions != NO_NUM_PARTITIONS || topic.replicationFactor != NO_REPLICATION_FACTOR)
             && !topic.assignments().isEmpty) {
           throw new InvalidRequestException("Both numPartitions or replicationFactor and replicasAssignments were set. " +
             "Both cannot be used at the same time.")
         }
 
+        // 如果没有指定分区数和副本数，则使用默认参数
         val resolvedNumPartitions = if (topic.numPartitions == NO_NUM_PARTITIONS)
           defaultNumPartitions else topic.numPartitions
         val resolvedReplicationFactor = if (topic.replicationFactor == NO_REPLICATION_FACTOR)
           defaultReplicationFactor else topic.replicationFactor
 
+        // 如果用户指定了分区的副本列表(--partitions --replication-factor) ，则使用用户指定的副本列表，
+        // 否则调用 assignReplicasToBrokers 方法为主题分区生成副本列表,当然这个 Broker 肯定是 Controller
         val assignments = if (topic.assignments.isEmpty) {
           AdminUtils.assignReplicasToBrokers(
             brokers, resolvedNumPartitions, resolvedReplicationFactor)
@@ -180,19 +188,24 @@ class AdminManager(val config: KafkaConfig,
         }
         trace(s"Assignments for topic $topic are $assignments ")
 
+        // 将主题配置添加到 Properties 对象中
         val configs = new Properties()
         topic.configs.forEach(entry => configs.setProperty(entry.name, entry.value))
+        // 验证新主题的创建是否与 broker 规则兼容
         adminZkClient.validateTopicCreate(topic.name, assignments, configs)
         validateTopicCreatePolicy(topic, resolvedNumPartitions, resolvedReplicationFactor, assignments)
 
         // For responses with DescribeConfigs permission, populate metadata and configs. It is
         // safe to populate it before creating the topic because the values are unset if the
         // creation fails.
+        // 计算分区副本分配方式
         maybePopulateMetadataAndConfigs(includeConfigsAndMetadata, topic.name, configs, assignments)
 
         if (validateOnly) {
+          // 如果 validateOnly 为 true 的话，则仅验证该创建主题的方案是否正确，而不实际创建主题，所以此时不需要写入元数据
           CreatePartitionsMetadata(topic.name, assignments.keySet)
         } else {
+          // 把 topic 相关数据写入到 zk 中
           controllerMutationQuota.record(assignments.size)
           adminZkClient.createTopicWithAssignment(topic.name, configs, assignments, validate = false)
           CreatePartitionsMetadata(topic.name, assignments.keySet)
@@ -217,9 +230,11 @@ class AdminManager(val config: KafkaConfig,
       }).toBuffer
 
     // 2. if timeout <= 0, validateOnly or no topics can proceed return immediately
+    // 2、如果timeout <= 0，validateOnly为true或没有主题可以创建，则立即返回
     if (timeout <= 0 || validateOnly || !metadata.exists(_.error.is(Errors.NONE))) {
       val results = metadata.map { createTopicMetadata =>
         // ignore topics that already have errors
+        // 忽略已经有错误的主题
         if (createTopicMetadata.error.isSuccess && !validateOnly) {
           (createTopicMetadata.topic, new ApiError(Errors.REQUEST_TIMED_OUT, null))
         } else {
@@ -229,6 +244,7 @@ class AdminManager(val config: KafkaConfig,
       responseCallback(results)
     } else {
       // 3. else pass the assignments and errors to the delayed operation and set the keys
+      // 如果 timeout > 0 并且存在需要创建的主题，则根据超时时间创建延迟任务并将其添加到延迟主题里
       val delayedCreate = new DelayedCreatePartitions(timeout, metadata, this,
         responseCallback)
       val delayedCreateKeys = toCreate.values.map(topic => TopicKey(topic.name)).toBuffer
@@ -241,15 +257,18 @@ class AdminManager(val config: KafkaConfig,
     * Delete topics and wait until the topics have been completely deleted.
     * The callback function will be triggered either when timeout, error or the topics are deleted.
     */
-  def deleteTopics(timeout: Int,
-                   topics: Set[String],
-                   controllerMutationQuota: ControllerMutationQuota,
-                   responseCallback: Map[String, Errors] => Unit): Unit = {
+  def deleteTopics(timeout: Int, // 创建主题的超时时间，单位为毫秒。
+                   topics: Set[String], // 要删除 Topic 集合
+                   controllerMutationQuota: ControllerMutationQuota, // 控制器变更配额，在创建主题时用于记录控制器变更的数量。
+                   responseCallback: Map[String, Errors] => Unit): Unit = { // 回调函数，用于在删除完成后接收结果。
     // 1. map over topics calling the asynchronous delete
+    // 遍历传入的要删除的主题，并删除相应主题
     val metadata = topics.map { topic =>
         try {
           controllerMutationQuota.record(metadataCache.numPartitions(topic).getOrElse(0).toDouble)
+          // 往 zk 中写入数据 标记要被删除的 topic /admin/delete_topics/{TopicName}
           adminZkClient.deleteTopic(topic)
+          // 删除 Topic 元数据
           DeleteTopicMetadata(topic, Errors.NONE)
         } catch {
           case _: TopicAlreadyMarkedForDeletionException =>
@@ -265,9 +284,11 @@ class AdminManager(val config: KafkaConfig,
     }
 
     // 2. if timeout <= 0 or no topics can proceed return immediately
+    // 2、如果客户端传过来的 timeout<=0 或者 没有主题可以删除 则直接返回异常
     if (timeout <= 0 || !metadata.exists(_.error == Errors.NONE)) {
       val results = metadata.map { deleteTopicMetadata =>
         // ignore topics that already have errors
+        // 忽略已经有错误的主题
         if (deleteTopicMetadata.error == Errors.NONE) {
           (deleteTopicMetadata.topic, Errors.REQUEST_TIMED_OUT)
         } else {
@@ -277,6 +298,7 @@ class AdminManager(val config: KafkaConfig,
       responseCallback(results)
     } else {
       // 3. else pass the topics and errors to the delayed operation and set the keys
+      //  如果 timeout > 0 并且存在需要删除的主题，则根据超时时间创建延迟任务并将其添加到延迟主题里
       val delayedDelete = new DelayedDeleteTopics(timeout, metadata.toSeq, this, responseCallback)
       val delayedDeleteKeys = topics.map(TopicKey).toSeq
       // try to complete the request immediately, otherwise put it into the purgatory

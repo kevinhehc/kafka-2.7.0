@@ -471,43 +471,63 @@ public class KafkaAdminClient extends AdminClient {
     }
 
     static KafkaAdminClient createInternal(AdminClientConfig config, TimeoutProcessorFactory timeoutProcessorFactory) {
+        // 用于记录和报告指标的 Metrics 对象
         Metrics metrics = null;
+        // 客户端与服务器之间进行网络通信的 NetworkClient 对象
         NetworkClient networkClient = null;
+        // Time 对象，提供时间相关的操作
         Time time = Time.SYSTEM;
+        // 生成 Kafka 客户端ID
         String clientId = generateClientId(config);
+        // 构建客户端与服务器之间的通信渠道的 ChannelBuilder 对象
         ChannelBuilder channelBuilder = null;
+        // 选择就绪的网络连接的 Selector 对象
         Selector selector = null;
+        // Kafka 集群支持的 API 版本信息
         ApiVersions apiVersions = new ApiVersions();
+        // 创建日志上下文
         LogContext logContext = createLogContext(clientId);
 
         try {
             // Since we only request node information, it's safe to pass true for allowAutoTopicCreation (and it
             // simplifies communication with older brokers)
+            // 创建 AdminMetadataManager 对象，并设置重试和元数据最大缓存时间配置
             AdminMetadataManager metadataManager = new AdminMetadataManager(logContext,
                 config.getLong(AdminClientConfig.RETRY_BACKOFF_MS_CONFIG),
                 config.getLong(AdminClientConfig.METADATA_MAX_AGE_CONFIG));
+            // 解析和验证 bootstrap 服务器地址，更新 metadataManager 的集群信息
             List<InetSocketAddress> addresses = ClientUtils.parseAndValidateAddresses(
                     config.getList(AdminClientConfig.BOOTSTRAP_SERVERS_CONFIG),
                     config.getString(AdminClientConfig.CLIENT_DNS_LOOKUP_CONFIG));
+            // 将初始化的 Cluster 设置到 metadataManager 中,并设置其 state 为 QUIESCENT 状态.
             metadataManager.update(Cluster.bootstrap(addresses), time.milliseconds());
+            // 根据配置创建 MetricsReporter 实例，并配置相关参数
             List<MetricsReporter> reporters = config.getConfiguredInstances(AdminClientConfig.METRIC_REPORTER_CLASSES_CONFIG,
                 MetricsReporter.class,
                 Collections.singletonMap(AdminClientConfig.CLIENT_ID_CONFIG, clientId));
+            // 配置 Metrics 的标签和参数
             Map<String, String> metricTags = Collections.singletonMap("client-id", clientId);
             MetricConfig metricConfig = new MetricConfig().samples(config.getInt(AdminClientConfig.METRICS_NUM_SAMPLES_CONFIG))
                 .timeWindow(config.getLong(AdminClientConfig.METRICS_SAMPLE_WINDOW_MS_CONFIG), TimeUnit.MILLISECONDS)
                 .recordLevel(Sensor.RecordingLevel.forName(config.getString(AdminClientConfig.METRICS_RECORDING_LEVEL_CONFIG)))
                 .tags(metricTags);
+            // 创建 JmxReporter 实例，启用 JMX 监控
             JmxReporter jmxReporter = new JmxReporter();
             jmxReporter.configure(config.originals());
             reporters.add(jmxReporter);
+            // 创建 MetricsContext 实例，用于向 Metrics 对象提供上下文信息
             MetricsContext metricsContext = new KafkaMetricsContext(JMX_PREFIX,
                     config.originalsWithPrefix(CommonClientConfigs.METRICS_CONTEXT_PREFIX));
+            // 创建 Metrics 实例，用于记录和报告指标
             metrics = new Metrics(metricConfig, reporters, time, metricsContext);
+            // 指标组前缀
             String metricGrpPrefix = "admin-client";
+            // 创建 ChannelBuilder 对象，用于构建客户端与服务器之间的通信渠道
             channelBuilder = ClientUtils.createChannelBuilder(config, time, logContext);
+            // 创建 Selector 对象，用于选择就绪的网络连接
             selector = new Selector(config.getLong(AdminClientConfig.CONNECTIONS_MAX_IDLE_MS_CONFIG),
                     metrics, time, metricGrpPrefix, channelBuilder, logContext);
+            // 创建 NetworkClient 对象，用于客户端与服务器之间进行网络通信
             networkClient = new NetworkClient(
                 selector,
                 metadataManager.updater(),
@@ -525,6 +545,7 @@ public class KafkaAdminClient extends AdminClient {
                 true,
                 apiVersions,
                 logContext);
+            // 创建并返回 KafkaAdminClient 实例
             return new KafkaAdminClient(config, clientId, time, metadataManager, metrics, networkClient,
                 timeoutProcessorFactory, logContext);
         } catch (Throwable exc) {
@@ -696,12 +717,16 @@ public class KafkaAdminClient extends AdminClient {
      * Provides the controller node.
      */
     private class ControllerNodeProvider implements NodeProvider {
+        // 为 Kafka 提供一个可用的 Controller 节点，以确保消息的正常发送和接收
         @Override
         public Node provide() {
+            // 首先判断 metadataManager 对象是否已准备就绪并且是否已确定 Controller 节点
             if (metadataManager.isReady() &&
                     (metadataManager.controller() != null)) {
+                // 返回该控制器节点
                 return metadataManager.controller();
             }
+            // 否则，发起请求更新
             metadataManager.requestUpdate();
             return null;
         }
@@ -1038,6 +1063,7 @@ public class KafkaAdminClient extends AdminClient {
          */
         private boolean maybeDrainPendingCall(Call call, long now) {
             try {
+                // 根据 MetadataUpdateNodeIdProvider 随机获取一个 broker 节点，同时把 metadata 请求信息添加到 callsToSend 队列中.
                 Node node = call.nodeProvider.provide();
                 if (node != null) {
                     log.trace("Assigned {} to node {}", call, node);
@@ -1181,6 +1207,7 @@ public class KafkaAdminClient extends AdminClient {
                     }
                 } else {
                     try {
+                        // 最终调用 call#handleResponse
                         call.handleResponse(response.responseBody());
                         if (log.isTraceEnabled())
                             log.trace("{} got response {}", call,
@@ -1253,10 +1280,12 @@ public class KafkaAdminClient extends AdminClient {
             return false;
         }
 
+        // 启动 AdminClientRunnable I/O 线程
         @Override
         public void run() {
             log.trace("Thread starting");
             try {
+                // 处理请求
                 processRequests();
             } finally {
                 AppInfoParser.unregisterAppInfo(JMX_PREFIX, clientId, metrics);
@@ -1280,10 +1309,12 @@ public class KafkaAdminClient extends AdminClient {
             }
         }
 
+        // 处理请求，最主要是获取元数据
         private void processRequests() {
             long now = time.milliseconds();
             while (true) {
                 // Copy newCalls into pendingCalls.
+                // 将 newCalls 队列中新生成的 Request 移动到 pendingCalls 队列中
                 drainNewCalls();
 
                 // Check if the AdminClient thread should shut down.
@@ -1297,23 +1328,34 @@ public class KafkaAdminClient extends AdminClient {
                 timeoutCallsToSend(timeoutProcessor);
                 timeoutCallsInFlight(timeoutProcessor);
 
+
                 long pollTimeout = Math.min(1200000, timeoutProcessor.nextTimeoutMs());
                 if (curHardShutdownTimeMs != INVALID_SHUTDOWN_TIME) {
                     pollTimeout = Math.min(pollTimeout, curHardShutdownTimeMs - now);
                 }
 
                 // Choose nodes for our pending calls.
+                // maybeDrainPendingCalls：将 pendingCalls 队列的 Request 移动到 callsToSend 队列中( 根据 Call.nodeProvide 查找到 node)
                 pollTimeout = Math.min(pollTimeout, maybeDrainPendingCalls(now));
+                // 判断当前 metadata 是否过期,初始化实例时 metadataFetchDelayMs 函数返回 0,表示过期需要重新获取 metadata。
                 long metadataFetchDelayMs = metadataManager.metadataFetchDelayMs(now);
                 if (metadataFetchDelayMs == 0) {
+                    // 将 metadataManager 对应的 state 的状态设置为 UPDATE_PENDING。
                     metadataManager.transitionToUpdatePending(now);
+                    // 生成 MetadataRequest 请求实例,此时将向 bootstrap.servers 配置的 broker 节点的随机一个节点发起请求。
                     Call metadataCall = makeMetadataCall(now);
                     // Create a new metadata fetch call and add it to the end of pendingCalls.
                     // Assign a node for just the new call (we handled the other pending nodes above).
 
+                    // 将获取 metadata 信息的 Call 实例添加到 callsToSend 队列中。
                     if (!maybeDrainPendingCall(metadataCall, now))
                         pendingCalls.add(metadataCall);
                 }
+                // 执行 sendEligibleCalls 方法发起 MetadataRequest 请求。
+                // callsToSend 队列中的 Request 向指定的目标节点发起网络请求，
+                // 此时请求将由 broker 端接收到后,会被 ForwardingManager 组件包装为 EnvelopeRequest 后,
+                // 直接转发给 activeController 进行处理.通过ForwardingManager中的BrokerToControllerChannelManager
+                // 向activeController转发请求。
                 pollTimeout = Math.min(pollTimeout, sendEligibleCalls(now));
 
                 if (metadataFetchDelayMs > 0) {
@@ -1334,6 +1376,7 @@ public class KafkaAdminClient extends AdminClient {
 
                 // Update the current time and handle the latest responses.
                 now = time.milliseconds();
+                // 最后当 broker 端接收并完成对 MetadataRequest 请求处理后进行响应的 response
                 handleResponses(now, responses);
             }
         }
@@ -1474,26 +1517,41 @@ public class KafkaAdminClient extends AdminClient {
     @Override
     public CreateTopicsResult createTopics(final Collection<NewTopic> newTopics,
                                            final CreateTopicsOptions options) {
+        // 生成 topic 创建是否成功的 future 监听, client 端可通过对函数调用的返回值来监听创建的成功失败。
         final Map<String, KafkaFutureImpl<TopicMetadataAndConfig>> topicFutures = new HashMap<>(newTopics.size());
+        // 创建一个 CreatableTopicCollection 对象来存储需要创建的主题
         final CreatableTopicCollection topics = new CreatableTopicCollection();
+        // 遍历每个 NewTopic 对象
         for (NewTopic newTopic : newTopics) {
+            // 检查 topic 名称是否无法表示
             if (topicNameIsUnrepresentable(newTopic.name())) {
+                // 如果无法表示，创建一个完成异常的future对象，并将其放入topicFutures中
                 KafkaFutureImpl<TopicMetadataAndConfig> future = new KafkaFutureImpl<>();
                 future.completeExceptionally(new InvalidTopicException("The given topic name '" +
                     newTopic.name() + "' cannot be represented in a request."));
                 topicFutures.put(newTopic.name(), future);
+                // 如果 topicFutures 中不包含该 topic 名称，则在 topicFutures 中创建一个空的KafkaFutureImpl 对象，
+                // 并将其作为 value，topic 名称作为 key 放入 topicFutures 中
             } else if (!topicFutures.containsKey(newTopic.name())) {
                 topicFutures.put(newTopic.name(), new KafkaFutureImpl<>());
+                // 将 NewTopic 对象转换为 CreatableTopic 对象，并添加到
                 topics.add(newTopic.convertToCreatableTopic());
             }
         }
+        // 4、如果 topics 不为空，则执行创建主题的操作 如果校验并转换为`CreatableTopic`的信息不为空,
+        // 生成发起`CreateTopicsRequest`请求的`Call`实例.
         if (!topics.isEmpty()) {
+            // 获取当前时间
             final long now = time.milliseconds();
+            // 计算截止时间
             final long deadline = calcDeadlineMs(now, options.timeoutMs());
+            // 创建一个 Call 对象，用于执行创建主题的操作
             final Call call = getCreateTopicsCall(options, topicFutures, topics,
                 Collections.emptyMap(), now, deadline);
+            // 调用 runnable 对象的 call 方法来执行 Call 对象,并添加到 runnable 线程的 newCalls 队列中。
             runnable.call(call, now);
         }
+        // 返回一个新的 CreateTopicsResult 对象，其中包含 topicFutures 的副本
         return new CreateTopicsResult(new HashMap<>(topicFutures));
     }
 
@@ -1601,26 +1659,39 @@ public class KafkaAdminClient extends AdminClient {
     @Override
     public DeleteTopicsResult deleteTopics(final Collection<String> topicNames,
                                            final DeleteTopicsOptions options) {
+        // 创建一个 Map 来存储主题和对应的KafkaFutureImpl<Void>对象，初始容量为主题名列表的大小
         final Map<String, KafkaFutureImpl<Void>> topicFutures = new HashMap<>(topicNames.size());
+        // 创建一个 List 来存储有效的主题名，初始容量为主题名列表的大小
         final List<String> validTopicNames = new ArrayList<>(topicNames.size());
+        // 遍历主题名列表中的每个主题名
         for (String topicName : topicNames) {
+            // 检查 topic 名称是否无法表示
             if (topicNameIsUnrepresentable(topicName)) {
                 KafkaFutureImpl<Void> future = new KafkaFutureImpl<>();
                 future.completeExceptionally(new InvalidTopicException("The given topic name '" +
                     topicName + "' cannot be represented in a request."));
+                // 将主题名和对应的异常完成的KafkaFutureImpl对象放入topicFutures中
                 topicFutures.put(topicName, future);
             } else if (!topicFutures.containsKey(topicName)) {
+                // 将该主题名和一个新的KafkaFutureImpl对象放入topicFutures中
                 topicFutures.put(topicName, new KafkaFutureImpl<>());
+                // 将该主题名添加到有效的主题名列表中
                 validTopicNames.add(topicName);
             }
         }
+        // 如果有效的主题名列表不为空
         if (!validTopicNames.isEmpty()) {
+            // 获取当前的时间戳
             final long now = time.milliseconds();
+            // 计算截止时间，根据当前时间和指定的超时时间
             final long deadline = calcDeadlineMs(now, options.timeoutMs());
+            // 构造一个调用对象，用于执行删除主题的操作
             final Call call = getDeleteTopicsCall(options, topicFutures, validTopicNames,
                 Collections.emptyMap(), now, deadline);
+            // 调用 runnable 对象的 call 方法来执行 Call 对象,并添加到 runnable 线程的 newCalls 队列中。
             runnable.call(call, now);
         }
+        // 返回一个 DeleteTopicsResult 对象，其中包含 topicFutures 的副本
         return new DeleteTopicsResult(new HashMap<>(topicFutures));
     }
 

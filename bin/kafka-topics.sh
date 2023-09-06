@@ -14,4 +14,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# 调用 $base_dir/kafka-run-class.sh 脚本并传递相应的参数。其中 "@ 代表传递的为命令行参数。
+# 具体执行的封装在 Kafka Core 包中的 TopicCommand 类。
 exec $(dirname $0)/kafka-run-class.sh kafka.admin.TopicCommand "$@"

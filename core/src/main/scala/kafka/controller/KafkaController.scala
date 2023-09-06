@@ -733,13 +733,17 @@ class KafkaController(val config: KafkaConfig,
    */
   private def onNewPartitionCreation(newPartitions: Set[TopicPartition]): Unit = {
     info(s"New partition creation callback for ${newPartitions.mkString(",")}")
+    // 将待创建的分区状态流转为 NewPartition
     partitionStateMachine.handleStateChanges(newPartitions.toSeq, NewPartition)
+    // 将待创建的副本状态流转 NewReplica
     replicaStateMachine.handleStateChanges(controllerContext.replicasForPartition(newPartitions).toSeq, NewReplica)
+    // 将分区状态从刚刚的 NewPartition 流转为 OnlinePartition
     partitionStateMachine.handleStateChanges(
       newPartitions.toSeq,
       OnlinePartition,
       Some(OfflinePartitionLeaderElectionStrategy(false))
     )
+    // 将副本状态从刚刚的 NewReplica 流转为 OnlineReplica，更新下内存
     replicaStateMachine.handleStateChanges(controllerContext.replicasForPartition(newPartitions).toSeq, OnlineReplica)
   }
 
@@ -1829,19 +1833,28 @@ class KafkaController(val config: KafkaConfig,
   }
 
   private def processTopicDeletion(): Unit = {
+    // 如果非 Contorller，直接返回
     if (!isActive) return
+    // 获取要删除的主题集合
     var topicsToBeDeleted = zkClient.getTopicDeletions.toSet
     debug(s"Delete topics listener fired for topics ${topicsToBeDeleted.mkString(",")} to be deleted")
+    // 如果 /admin/delete_topics/ 下面的节点有不存在的Topic，则清理掉。
     val nonExistentTopics = topicsToBeDeleted -- controllerContext.allTopics
+    // 如果存在非存在的主题
     if (nonExistentTopics.nonEmpty) {
       warn(s"Ignoring request to delete non-existing topics ${nonExistentTopics.mkString(",")}")
+      // 从zookeeper中删除非存在的主题
       zkClient.deleteTopicDeletions(nonExistentTopics.toSeq, controllerContext.epochZkVersion)
     }
+    // 从要删除的主题集合中移除不存在的主题
     topicsToBeDeleted --= nonExistentTopics
+    // 如果启用了删除主题功能
     if (config.deleteTopicEnable) {
+      // 如果还存在要删除的主题
       if (topicsToBeDeleted.nonEmpty) {
         info(s"Starting topic deletion for topics ${topicsToBeDeleted.mkString(",")}")
         // mark topic ineligible for deletion if other state changes are in progress
+        // 如果其他状态更改正在进行中，则标记主题不可删除
         topicsToBeDeleted.foreach { topic =>
           val partitionReassignmentInProgress =
             controllerContext.partitionsBeingReassigned.map(_.topic).contains(topic)
@@ -1850,11 +1863,13 @@ class KafkaController(val config: KafkaConfig,
               reason = "topic reassignment in progress")
         }
         // add topic to deletion list
+        //  将主题添加到删除列表中，重启主题删除操作
         topicDeletionManager.enqueueTopicsForDeletion(topicsToBeDeleted)
       }
     } else {
       // If delete topic is disabled remove entries under zookeeper path : /admin/delete_topics
       info(s"Removing $topicsToBeDeleted since delete topic is disabled")
+      // 如果禁用了删除主题功能，则删除zookeeper路径下的条目：/admin/delete_topics
       zkClient.deleteTopicDeletions(topicsToBeDeleted.toSeq, controllerContext.epochZkVersion)
     }
   }

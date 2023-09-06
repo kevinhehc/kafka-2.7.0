@@ -96,15 +96,18 @@ class AdminZkClient(zkClient: KafkaZkClient) extends Logging {
                                 partitionReplicaAssignment: Map[Int, Seq[Int]],
                                 validate: Boolean = true): Unit = {
     if (validate)
+    // 验证新主题的创建是否与 broker 规则兼容
       validateTopicCreate(topic, partitionReplicaAssignment, config)
 
     info(s"Creating topic $topic with configuration $config and initial partition " +
       s"assignment $partitionReplicaAssignment")
 
     // write out the config if there is any, this isn't transactional with the partition assignments
+    // 1、将 topic 配置相关信息写入到 zk 中
     zkClient.setOrCreateEntityConfigs(ConfigType.Topic, topic, config)
 
     // create the partition assignment
+    // 2、将 topic 分区相关信息写入 zk 中
     writeTopicPartitionAssignment(topic, partitionReplicaAssignment.map { case (k, v) => k -> ReplicaAssignment(v) },
       isUpdate = false)
   }
@@ -155,6 +158,7 @@ class AdminZkClient(zkClient: KafkaZkClient) extends Logging {
 
   private def writeTopicPartitionAssignment(topic: String, replicaAssignment: Map[Int, ReplicaAssignment], isUpdate: Boolean): Unit = {
     try {
+      // 将进程的完整副本分配映射到所述主题的当期已知分区。
       val assignment = replicaAssignment.map { case (partitionId, replicas) => (new TopicPartition(topic,partitionId), replicas) }.toMap
 
       if (!isUpdate) {
@@ -176,13 +180,17 @@ class AdminZkClient(zkClient: KafkaZkClient) extends Logging {
   def deleteTopic(topic: String): Unit = {
     if (zkClient.topicExists(topic)) {
       try {
+        // 如果主题存在，在 zookeeper 上创建删除主题的路径  /admin/delete_topics/{TopicName}
         zkClient.createDeleteTopicPath(topic)
       } catch {
+        //  如果节点已存在，则抛出主题已标记删除异常
         case _: NodeExistsException => throw new TopicAlreadyMarkedForDeletionException(
           "topic %s is already marked for deletion".format(topic))
+        // 如果发生其他错误，则抛出操作异常
         case e: Throwable => throw new AdminOperationException(e.getMessage)
        }
     } else {
+      //  如果主题不存在，则抛出主题不存在或分区异常
       throw new UnknownTopicOrPartitionException(s"Topic `$topic` to delete does not exist")
     }
   }

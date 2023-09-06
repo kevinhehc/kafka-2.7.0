@@ -68,6 +68,8 @@ object TopicCommand extends Logging {
         topicService.listTopics(opts)
       else if (opts.hasDescribeOption)
         topicService.describeTopic(opts)
+
+      // 如果命令行输入 --delete 后会执行该方法
       else if (opts.hasDeleteOption)
         topicService.deleteTopic(opts)
     } catch {
@@ -222,26 +224,33 @@ object TopicCommand extends Logging {
   object AdminClientTopicService {
     def createAdminClient(commandConfig: Properties, bootstrapServer: Option[String]): Admin = {
       bootstrapServer match {
+        // 如果有指定 Kafka 集群地址，则设置到命令配置中
         case Some(serverList) => commandConfig.put(CommonClientConfigs.BOOTSTRAP_SERVERS_CONFIG, serverList)
         case None =>
       }
+      // 创建 AdminClient 实例，底层调用 clients 包下面的
       Admin.create(commandConfig)
     }
 
+    // 默认会执行该方法，类似注解，会调用 createAdminClient
     def apply(commandConfig: Properties, bootstrapServer: Option[String]): AdminClientTopicService =
       new AdminClientTopicService(createAdminClient(commandConfig, bootstrapServer))
   }
 
   case class AdminClientTopicService private (adminClient: Admin) extends TopicService {
 
+    // 创建 Topic
     override def createTopic(topic: CommandTopicPartition): Unit = {
+      // 如果配置了副本副本数参数 --replication-factor 时必须大于 0，否则抛异常
       if (topic.replicationFactor.exists(rf => rf > Short.MaxValue || rf < 1))
         throw new IllegalArgumentException(s"The replication factor must be between 1 and ${Short.MaxValue} inclusive")
+      // 如果配置了分区数参数 --partitions 时也必须大于 0，否则抛异常
       if (topic.partitions.exists(partitions => partitions < 1))
         throw new IllegalArgumentException(s"The partitions must be greater than 0")
 
       try {
         val newTopic = if (topic.hasReplicaAssignment)
+        // 如果指定了--replica-assignment参数，则按照指定的来分配副本
           new NewTopic(topic.name, asJavaReplicaReassignment(topic.replicaAssignment.get))
         else {
           new NewTopic(
@@ -250,12 +259,14 @@ object TopicCommand extends Logging {
             topic.replicationFactor.map(_.toShort).map(Short.box).asJava)
         }
 
+        // 将配置参数 --config 解析成一个配置 map
         val configsMap = topic.configsToAdd.stringPropertyNames()
           .asScala
           .map(name => name -> topic.configsToAdd.getProperty(name))
           .toMap.asJava
 
         newTopic.configs(configsMap)
+        // 最后调用 adminClient 创建 Topic
         val createResult = adminClient.createTopics(Collections.singleton(newTopic),
           new CreateTopicsOptions().retryOnQuotaViolation(false))
         createResult.all().get()
@@ -352,19 +363,28 @@ object TopicCommand extends Logging {
       }
     }
 
+    // 删除 Topic
     override def deleteTopic(opts: TopicCommandOptions): Unit = {
+      // 先获取 Topics
       val topics = getTopics(opts.topic, opts.excludeInternalTopics)
+      // 确认 Topic 是否存在，不存在无法删除
       ensureTopicExists(topics, opts.topic, !opts.ifExists)
+      // 调用 adminClient 来删除 Topic
       adminClient.deleteTopics(topics.asJavaCollection, new DeleteTopicsOptions().retryOnQuotaViolation(false))
         .all().get()
     }
 
+    // 获取 Topics
     override def getTopics(topicIncludelist: Option[String], excludeInternalTopics: Boolean = false): Seq[String] = {
       val allTopics = if (excludeInternalTopics) {
+        // 获取所有主题
         adminClient.listTopics()
       } else {
+        // 获取所有内部主题
         adminClient.listTopics(new ListTopicsOptions().listInternal(true))
       }
+      // 根据给定的条件来过滤主题列表，返回符合条件的主题列表。
+      // 如果有主题包含列表，则只返回允许的主题；如果没有主题包含列表，则根据是否排除内部主题的条件来过滤主题
       doGetTopics(allTopics.names().get().asScala.toSeq.sorted, topicIncludelist, excludeInternalTopics)
     }
 
@@ -532,6 +552,7 @@ object TopicCommand extends Logging {
     *                           If set to true, the command will throw an exception if the topic with the
     *                           requested name does not exist.
     */
+  // 确保 Topic 是否存在，否则抛异常
   private def ensureTopicExists(foundTopics: Seq[String], requestedTopic: Option[String], requireTopicExists: Boolean): Unit = {
     // If no topic name was mentioned, do not need to throw exception.
     if (requestedTopic.isDefined && requireTopicExists && foundTopics.isEmpty) {
@@ -541,10 +562,14 @@ object TopicCommand extends Logging {
   }
 
   private def doGetTopics(allTopics: Seq[String], topicIncludeList: Option[String], excludeInternalTopics: Boolean): Seq[String] = {
+    // 如果主题包含列表不为空
     if (topicIncludeList.isDefined) {
+      // 创建一个 IncludeList 实例，使用主题包含列表作为构造函数的参数
       val topicsFilter = IncludeList(topicIncludeList.get)
+      // 根据过滤条件来过滤所有主题，只返回允许的主题列表
       allTopics.filter(topicsFilter.isTopicAllowed(_, excludeInternalTopics))
     } else
+    // 如果主题包含列表为空，根据是否排除内部主题的条件来过滤所有主题，只返回非内部主题的列表
     allTopics.filterNot(Topic.isInternal(_) && excludeInternalTopics)
   }
 

@@ -1919,6 +1919,7 @@ class KafkaApis(val requestChannel: RequestChannel, // 请求通道
     }
 
     val createTopicsRequest = request.body[CreateTopicsRequest]
+    // 如果当前 Broker 不是属于 Controller 的话，则抛出异常。
     val results = new CreatableTopicResultCollection(createTopicsRequest.data.topics.size)
     if (!controller.isActive) {
       createTopicsRequest.data.topics.forEach { topic =>
@@ -2051,9 +2052,13 @@ class KafkaApis(val requestChannel: RequestChannel, // 请求通道
       sendResponseMaybeThrottle(controllerMutationQuota, request, createResponse, onComplete = None)
     }
 
+    // 获取 DeleteTopicsRequest
     val deleteTopicRequest = request.body[DeleteTopicsRequest]
+    // 创建结果集
     val results = new DeletableTopicResultCollection(deleteTopicRequest.data.topicNames.size)
+    // 创建用于存放待删除主题的集合
     val toDelete = mutable.Set[String]()
+    // 如果当前 Broker 不是 Controller，则返回错误
     if (!controller.isActive) {
       deleteTopicRequest.data.topicNames.forEach { topic =>
         results.add(new DeletableTopicResult()
@@ -2062,6 +2067,7 @@ class KafkaApis(val requestChannel: RequestChannel, // 请求通道
       }
       sendResponseCallback(results)
     } else if (!config.deleteTopicEnable) {
+      // 如果禁用了 deleteTopic，则返回相关错误
       val error = if (request.context.apiVersion < 3) Errors.INVALID_REQUEST else Errors.TOPIC_DELETION_DISABLED
       deleteTopicRequest.data.topicNames.forEach { topic =>
         results.add(new DeletableTopicResult()
@@ -2070,33 +2076,45 @@ class KafkaApis(val requestChannel: RequestChannel, // 请求通道
       }
       sendResponseCallback(results)
     } else {
+      // 处理删除主题请求
+
+      // 获取请求中的主题 ID 集合
       deleteTopicRequest.data.topicNames.forEach { topic =>
         results.add(new DeletableTopicResult()
           .setName(topic))
       }
+      // 根据权限过滤需要描述和删除的主题
       val authorizedTopics = filterByAuthorized(request.context, DELETE, TOPIC,
         results.asScala)(_.name)
       results.forEach { topic =>
+        // 如果没有删除主题的权限，则返回错误
          if (!authorizedTopics.contains(topic.name))
            topic.setErrorCode(Errors.TOPIC_AUTHORIZATION_FAILED.code)
+         // 如果主题不存在，则返回错误
          else if (!metadataCache.contains(topic.name))
            topic.setErrorCode(Errors.UNKNOWN_TOPIC_OR_PARTITION.code)
+         // 添加到待删除集合中
          else
            toDelete += topic.name
       }
       // If no authorized topics return immediately
+      // 如果没有待删除的主题，则直接返回结果
       if (toDelete.isEmpty)
         sendResponseCallback(results)
       else {
+        // 执行删除主题操作
         def handleDeleteTopicsResults(errors: Map[String, Errors]): Unit = {
+          // 处理删除主题的结果
           errors.foreach {
             case (topicName, error) =>
               results.find(topicName)
                 .setErrorCode(error.code)
           }
+          // 返回结果
           sendResponseCallback(results)
         }
 
+        // 调用 adminManager 删除 topics
         adminManager.deleteTopics(
           deleteTopicRequest.data.timeoutMs,
           toDelete,

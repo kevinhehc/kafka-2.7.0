@@ -874,16 +874,22 @@ class LogManager(logDirs: Seq[File],
    * @param isFuture True if the future log of the specified partition should be returned or created
    * @throws KafkaStorageException if isNew=false, log is not found in the cache and there is offline log directory on the broker
    */
+  // 用于获取或创建指定主题分区的日志对象
   def getOrCreateLog(topicPartition: TopicPartition, loadConfig: () => LogConfig, isNew: Boolean = false, isFuture: Boolean = false): Log = {
+    // 加锁，确保创建和删除日志的安全性
     logCreationOrDeletionLock synchronized {
+      // 获取指定主题分区的日志，如果不存在则进行创建
       getLog(topicPartition, isFuture).getOrElse {
         // create the log if it has not already been created in another thread
+        // 如果不是新建日志且存在离线日志目录，则抛出异常
         if (!isNew && offlineLogDirs.nonEmpty)
           throw new KafkaStorageException(s"Can not create log for $topicPartition because log directories ${offlineLogDirs.mkString(",")} are offline")
 
+        // 获取日志目录
         val logDirs: List[File] = {
           val preferredLogDir = preferredLogDirs.get(topicPartition)
 
+          // 如果是 Future，则需要指定首选日志目录
           if (isFuture) {
             if (preferredLogDir == null)
               throw new IllegalStateException(s"Can not create the future log for $topicPartition without having a preferred log directory")
@@ -891,12 +897,15 @@ class LogManager(logDirs: Seq[File],
               throw new IllegalStateException(s"Can not create the future log for $topicPartition in the current log directory of this partition")
           }
 
+          // 如果存在首选日志目录，则使用首选日志目录创建日志目录列表
           if (preferredLogDir != null)
             List(new File(preferredLogDir))
           else
+          // 否则使用下一个可用的日志目录
             nextLogDirs()
         }
 
+        // 根据是否为 Future 来获取不同日志目录名称
         val logDirName = {
           if (isFuture)
             Log.logFutureDirName(topicPartition)
@@ -904,6 +913,7 @@ class LogManager(logDirs: Seq[File],
             Log.logDirName(topicPartition)
         }
 
+        // 遍历日志目录列表，找到可以成功创建日志目录的路径，如果找不到则抛出异常
         val logDir = logDirs
           .iterator // to prevent actually mapping the whole list, lazy map
           .map(createLogDirectory(_, logDirName))
@@ -911,7 +921,9 @@ class LogManager(logDirs: Seq[File],
           .getOrElse(Failure(new KafkaStorageException("No log directories available. Tried " + logDirs.map(_.getAbsolutePath).mkString(", "))))
           .get // If Failure, will throw
 
+        // 获取日志配置信息
         val config = loadConfig()
+        // 创建日志对象
         val log = Log(
           dir = logDir,
           config = config,
@@ -924,6 +936,7 @@ class LogManager(logDirs: Seq[File],
           brokerTopicStats = brokerTopicStats,
           logDirFailureChannel = logDirFailureChannel)
 
+        // 如果是 Future，则将日志对象添加到 futureLogs 中，否则添加到currentLogs中
         if (isFuture)
           futureLogs.put(topicPartition, log)
         else

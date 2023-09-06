@@ -352,26 +352,37 @@ class KafkaZkClient private[zk] (zooKeeperClient: ZooKeeperClient, isSecure: Boo
    * @param sanitizedEntityName entity name
    * @throws KeeperException if there is an error while setting or creating the znode
    */
+  // 写入或更新实体配置
   def setOrCreateEntityConfigs(rootEntityType: String, sanitizedEntityName: String, config: Properties) = {
 
+    // 写入配置数据  configData: 待设置的配置数据 SetDataResponse:设置操作响应
     def set(configData: Array[Byte]): SetDataResponse = {
+      // 首先调用 SetDataRequest 请求，往 /config/topics/{TopicName} 写入数据，这里一般会返回 NONODE，
+      // 没有该节点，则往该节点写入数据，如果该节点存在，则直接覆盖。
       val setDataRequest = SetDataRequest(ConfigEntityZNode.path(rootEntityType, sanitizedEntityName),
         configData, ZkVersion.MatchAnyVersion)
       retryRequestUntilConnected(setDataRequest)
     }
 
+    // 创建或更新配置数据
     def createOrSet(configData: Array[Byte]): Unit = {
       val path = ConfigEntityZNode.path(rootEntityType, sanitizedEntityName)
+      // 尝试创建节点及其子节点（如果不存在）
       try createRecursive(path, configData)
       catch {
+        // 节点已经存在时更新配置数据
         case _: NodeExistsException => set(configData).maybeThrow()
       }
     }
 
+    // 将配置属性编码为字节数组
     val configData = ConfigEntityZNode.encode(config)
 
+    // 写入配置数据
     val setDataResponse = set(configData)
+    // 根据结果匹配处理
     setDataResponse.resultCode match {
+      // 节点不存在则写入数据，并且节点类型是 PERSISTENT 持久节点
       case Code.NONODE => createOrSet(configData)
       case _ => setDataResponse.maybeThrow()
     }
