@@ -153,13 +153,18 @@ class TopicDeletionManager(config: KafkaConfig, // KafkaConfig类，保存Broker
    * @param replicas Replicas for which deletion has failed
    */
   def failReplicaDeletion(replicas: Set[PartitionAndReplica]): Unit = {
+    // 启用了删除主题功能
     if (isDeleteTopicEnabled) {
+      // 筛选出待删除 topic 集合中删除失败的 replicas
       val replicasThatFailedToDelete = replicas.filter(r => isTopicQueuedUpForDeletion(r.topic))
       if (replicasThatFailedToDelete.nonEmpty) {
+        // 如果有删除失败的 replicas，则记录下待删除的 topics 并使这些 replicas 的状态转变为ReplicaDeletionIneligible，
+        // 并将这些 topics 标记为不可删除
         val topics = replicasThatFailedToDelete.map(_.topic)
         debug(s"Deletion failed for replicas ${replicasThatFailedToDelete.mkString(",")}. Halting deletion for topics $topics")
         replicaStateMachine.handleStateChanges(replicasThatFailedToDelete.toSeq, ReplicaDeletionIneligible)
         markTopicIneligibleForDeletion(topics, reason = "replica deletion failure")
+        // 重启主题删除操作
         resumeDeletions()
       }
     }
@@ -208,9 +213,12 @@ class TopicDeletionManager(config: KafkaConfig, // KafkaConfig类，保存Broker
    * @param replicas Replicas that were successfully deleted by the broker
    */
   def completeReplicaDeletion(replicas: Set[PartitionAndReplica]): Unit = {
+    // 筛选出待删除 topic 集合中成功删除的 replicas
     val successfullyDeletedReplicas = replicas.filter(r => isTopicQueuedUpForDeletion(r.topic))
     debug(s"Deletion successfully completed for replicas ${successfullyDeletedReplicas.mkString(",")}")
+    // 将这些 replicas 的状态转变为 ReplicaDeletionSuccessful
     replicaStateMachine.handleStateChanges(successfullyDeletedReplicas.toSeq, ReplicaDeletionSuccessful)
+    // 重启主题删除操作
     resumeDeletions()
   }
 

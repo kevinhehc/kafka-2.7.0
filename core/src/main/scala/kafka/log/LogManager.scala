@@ -1096,30 +1096,41 @@ class LogManager(logDirs: Seq[File],
   def asyncDelete(topicPartition: TopicPartition,
                   isFuture: Boolean = false,
                   checkpoint: Boolean = true): Option[Log] = {
+    // 使用同步锁确保线程安全
     val removedLog: Option[Log] = logCreationOrDeletionLock synchronized {
+      // 从 currentLogs 或者 futureLogs 中移除指定的 topicPartition 的 Log，并返回被移除的 Log
       removeLogAndMetrics(if (isFuture) futureLogs else currentLogs, topicPartition)
     }
+    // 根据 removeLogAndMetrics 方法返回的结果 removedLog  进行处理
     removedLog match {
       case Some(removedLog) =>
         // We need to wait until there is no more cleaning task on the log to be deleted before actually deleting it.
+        // 我们需要等到要删除的日志上没有更多的清理任务，然后才能真正删除它。
         if (cleaner != null && !isFuture) {
+          // 终止正在进行的 Log 清理任务
           cleaner.abortCleaning(topicPartition)
           if (checkpoint) {
+            // 更新 Checkpoint 文件以进行删除操作
             cleaner.updateCheckpoints(removedLog.parentDirFile, partitionToRemove = Option(topicPartition))
           }
         }
+        // 将被删除的 Log 的目录重命名为日志删除目录，命名规则 topic-uuid-delete
         removedLog.renameDir(Log.logDeleteDirName(topicPartition))
         if (checkpoint) {
           val logDir = removedLog.parentDirFile
+          // 获取目录下的 Log 文件
           val logsToCheckpoint = logsInDir(logDir)
+          // 对 Log 文件进行 Checkpoint
           checkpointRecoveryOffsetsAndCleanSnapshotsInDir(logDir, logsToCheckpoint, ArrayBuffer.empty)
           checkpointLogStartOffsetsInDir(logDir, logsToCheckpoint)
         }
+        // 将被删除的 Log 添加到待删除列队列中，稍后会被异步删除
         addLogToBeDeleted(removedLog)
         info(s"Log for partition ${removedLog.topicPartition} is renamed to ${removedLog.dir.getAbsolutePath} and is scheduled for deletion")
 
       case None =>
         if (offlineLogDirs.nonEmpty) {
+          // 如果无法删除 Log，可能是因为 Log 所在的目录处于离线状态，抛出异常提示
           throw new KafkaStorageException(s"Failed to delete log for ${if (isFuture) "future" else ""} $topicPartition because it may be in one of the offline directories ${offlineLogDirs.mkString(",")}")
         }
     }

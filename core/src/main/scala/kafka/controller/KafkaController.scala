@@ -1491,18 +1491,23 @@ class KafkaController(val config: KafkaConfig,
   private def processTopicDeletionStopReplicaResponseReceived(replicaId: Int,
                                                               requestError: Errors,
                                                               partitionErrors: Map[TopicPartition, Errors]): Unit = {
+    // 如果当前 Broker 不是 Controler 直接返回
     if (!isActive) return
     debug(s"Delete topic callback invoked on StopReplica response received from broker $replicaId: " +
       s"request error = $requestError, partition errors = $partitionErrors")
 
+    // 获取存在错误的分区
     val partitionsInError = if (requestError != Errors.NONE)
       partitionErrors.keySet
     else
       partitionErrors.filter { case (_, error) => error != Errors.NONE }.keySet
 
+    // 根据存在错误的分区和 replicaId 获取存在错误的副本
     val replicasInError = partitionsInError.map(PartitionAndReplica(_, replicaId))
     // move all the failed replicas to ReplicaDeletionIneligible
+    // 将所有失败的副本移到 ReplicaDeletionIneligible 状态
     topicDeletionManager.failReplicaDeletion(replicasInError)
+    // 如果存在成功删除的副本，将其从存在错误的分区中移除，并标记为已完成删除
     if (replicasInError.size != partitionErrors.size) {
       // some replicas could have been successfully deleted
       val deletedReplicas = partitionErrors.keySet.diff(partitionsInError)
