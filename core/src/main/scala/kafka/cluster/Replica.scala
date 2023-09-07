@@ -66,14 +66,20 @@ class Replica(val brokerId: Int, val topicPartition: TopicPartition) extends Log
                        followerStartOffset: Long,
                        followerFetchTimeMs: Long,
                        leaderEndOffset: Long): Unit = {
+    // 如果 follower 的消息偏移量大于等于 leader 的最新偏移量
     if (followerFetchOffsetMetadata.messageOffset >= leaderEndOffset)
+    // 更新最后追上的时间
       _lastCaughtUpTimeMs = math.max(_lastCaughtUpTimeMs, followerFetchTimeMs)
+    // 如果 follower 的消息偏移量大于等于上一次 fetch 时的 leader 的最新偏移量
     else if (followerFetchOffsetMetadata.messageOffset >= lastFetchLeaderLogEndOffset)
+    // 更新最后追上的时间
       _lastCaughtUpTimeMs = math.max(_lastCaughtUpTimeMs, lastFetchTimeMs)
 
+    // 更新日志的起始偏移量和结束偏移量
     _logStartOffset = followerStartOffset
     _logEndOffsetMetadata = followerFetchOffsetMetadata
     lastFetchLeaderLogEndOffset = leaderEndOffset
+    // 更新最后 fetch 的时间
     lastFetchTimeMs = followerFetchTimeMs
   }
 

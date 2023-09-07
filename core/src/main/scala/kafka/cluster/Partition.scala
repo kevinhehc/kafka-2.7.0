@@ -557,15 +557,21 @@ class Partition(val topicPartition: TopicPartition,
    */
   def makeLeader(partitionState: LeaderAndIsrPartitionState,
                  highWatermarkCheckpoints: OffsetCheckpoints): Boolean = {
+    // 使用 leaderIsrUpdateLock 加锁，避免多线程同时操作
     val (leaderHWIncremented, isNewLeader) = inWriteLock(leaderIsrUpdateLock) {
       // record the epoch of the controller that made the leadership decision. This is useful while updating the isr
       // to maintain the decision maker controller's epoch in the zookeeper path
+      // 记录做出领导决策的控制器的 epoch，用于后续更新 isr 时在 ZooKeeper 路径中维护决策者控制器的 epoch
       controllerEpoch = partitionState.controllerEpoch
 
+      // 获取 ISR 副本集合列表
       val isr = partitionState.isr.asScala.map(_.toInt).toSet
+      // 将在 AR 副本集合列表的加进来
       val addingReplicas = partitionState.addingReplicas.asScala.map(_.toInt)
+      // 将不在 AR 副本集合列表的移除
       val removingReplicas = partitionState.removingReplicas.asScala.map(_.toInt)
 
+      // 更新以及分配副本
       updateAssignmentAndIsr(
         assignment = partitionState.replicas.asScala.map(_.toInt),
         isr = isr,
@@ -573,8 +579,10 @@ class Partition(val topicPartition: TopicPartition,
         removingReplicas = removingReplicas
       )
       try {
+        // 如果日志不存在，则创建日志
         createLogIfNotExists(partitionState.isNew, isFutureReplica = false, highWatermarkCheckpoints)
       } catch {
+        // 如果创建日志时出现 ZooKeeper 客户端异常，则打印错误日志，并返回 false（表示创建失败）
         case e: ZooKeeperClientException =>
           stateChangeLogger.error(s"A ZooKeeper client exception has occurred and makeLeader will be skipping the " +
             s"state change for the partition $topicPartition with leader epoch: $leaderEpoch ", e)
@@ -582,7 +590,9 @@ class Partition(val topicPartition: TopicPartition,
           return false
       }
 
+      // Leader 日志
       val leaderLog = localLogOrException
+      // Leader LEO
       val leaderEpochStartOffset = leaderLog.logEndOffset
       stateChangeLogger.info(s"Leader $topicPartition starts at leader epoch ${partitionState.leaderEpoch} from " +
         s"offset $leaderEpochStartOffset with high watermark ${leaderLog.highWatermark} " +
@@ -590,11 +600,13 @@ class Partition(val topicPartition: TopicPartition,
         s"removingReplicas ${removingReplicas.mkString("[", ",", "]")}. Previous leader epoch was $leaderEpoch.")
 
       //We cache the leader epoch here, persisting it only if it's local (hence having a log dir)
+      // 缓存 Leader Epoch，只有当有日志目录时才持久化
       leaderEpoch = partitionState.leaderEpoch
       leaderEpochStartOffsetOpt = Some(leaderEpochStartOffset)
       zkVersion = partitionState.zkVersion
 
       // Clear any pending AlterIsr requests and check replica state
+      // 清除任何挂起的 AlterIsr 请求，并检查副本状态
       alterIsrManager.clearPending(topicPartition)
 
       // In the case of successive leader elections in a short time period, a follower may have
@@ -602,20 +614,28 @@ class Partition(val topicPartition: TopicPartition,
       // to ensure that these followers can truncate to the right offset, we must cache the new
       // leader epoch and the start offset since it should be larger than any epoch that a follower
       // would try to query.
+      // 在短时间内连续进行多次领导选举时，一个 follower 可能有比新 leader 的日志更晚的 epoch 的记录。
+      // 为了确保这些 follower 可以截断到正确的偏移量，我们必须缓存新的 leader epoch 和起始偏移量，
+      // 因为它应该比任何一个 follower 试图查询的 epoch 大。
       leaderLog.maybeAssignEpochStartOffset(leaderEpoch, leaderEpochStartOffset)
 
+      // 它代表该 Broker 成为分区的新 Leader 副本（分区原 Leader 副本不是当前分区）
       val isNewLeader = !isLeader
       val curTimeMs = time.milliseconds
       // initialize lastCaughtUpTime of replicas as well as their lastFetchTimeMs and lastFetchLeaderLogEndOffset.
+      // 初始化副本的 lastCaughtUpTime、lastFetchTimeMs 和 lastFetchLeaderLogEndOffset
       remoteReplicas.foreach { replica =>
         val lastCaughtUpTimeMs = if (isrState.isr.contains(replica.brokerId)) curTimeMs else 0L
         replica.resetLastCaughtUpTime(leaderEpochStartOffset, curTimeMs, lastCaughtUpTimeMs)
       }
 
+      // 判断是否是新的 Leader
       if (isNewLeader) {
         // mark local replica as the leader after converting hw
+        // 将本地副本标记为 Leader，并重置远程副本的日志结束偏移量
         leaderReplicaIdOpt = Some(localBrokerId)
         // reset log end offset for remote replicas
+        // 重置远端 Follower 副本的 LEO
         remoteReplicas.foreach { replica =>
           replica.updateFetchState(
             followerFetchOffsetMetadata = LogOffsetMetadata.UnknownOffsetMetadata,
@@ -625,11 +645,14 @@ class Partition(val topicPartition: TopicPartition,
         }
       }
       // we may need to increment high watermark since ISR could be down to 1
+      // 如果满足更新 ISR 的条件，就更新 HW 信息。
       (maybeIncrementLeaderHW(leaderLog), isNewLeader)
     }
     // some delayed operations may be unblocked after HW changed
+    //  一些延迟操作可能在高水位标记改变后被解除阻塞
     if (leaderHWIncremented)
       tryCompleteDelayedRequests()
+    // 返回新 Leader
     isNewLeader
   }
 
@@ -641,13 +664,18 @@ class Partition(val topicPartition: TopicPartition,
    */
   def makeFollower(partitionState: LeaderAndIsrPartitionState,
                    highWatermarkCheckpoints: OffsetCheckpoints): Boolean = {
+    // 使用 leaderIsrUpdateLock 加锁，避免多线程同时操作
     inWriteLock(leaderIsrUpdateLock) {
+      // 分区 Leader 所在 Broker id
       val newLeaderBrokerId = partitionState.leader
+      // 旧 LeaderEpoch
       val oldLeaderEpoch = leaderEpoch
       // record the epoch of the controller that made the leadership decision. This is useful while updating the isr
       // to maintain the decision maker controller's epoch in the zookeeper path
+      // 记录控制器作出领导权决策的 epoch。在更新 isr 时保留决策者的 epoch 值，有助于维护 zookeeper 路径中的正确值。
       controllerEpoch = partitionState.controllerEpoch
 
+      // 更新以及分配副本
       updateAssignmentAndIsr(
         assignment = partitionState.replicas.asScala.iterator.map(_.toInt).toSeq,
         isr = Set.empty[Int],
@@ -655,8 +683,10 @@ class Partition(val topicPartition: TopicPartition,
         removingReplicas = partitionState.removingReplicas.asScala.map(_.toInt)
       )
       try {
+        // 如果日志不存在，则创建日志
         createLogIfNotExists(partitionState.isNew, isFutureReplica = false, highWatermarkCheckpoints)
       } catch {
+        // 如果创建日志时出现 ZooKeeper 客户端异常，则打印错误日志，并返回 false（表示创建失败）
         case e: ZooKeeperClientException =>
           stateChangeLogger.error(s"A ZooKeeper client exception has occurred. makeFollower will be skipping the " +
             s"state change for the partition $topicPartition with leader epoch: $leaderEpoch.", e)
@@ -664,22 +694,27 @@ class Partition(val topicPartition: TopicPartition,
           return false
       }
 
+      // Follower 日志
       val followerLog = localLogOrException
       val leaderEpochEndOffset = followerLog.logEndOffset
       stateChangeLogger.info(s"Follower $topicPartition starts at leader epoch ${partitionState.leaderEpoch} from " +
         s"offset $leaderEpochEndOffset with high watermark ${followerLog.highWatermark}. " +
         s"Previous leader epoch was $leaderEpoch.")
 
+      // 记录新的 Leader epoch，清除前任 Leader 信息，更新 zkVersion 和 isLeader 属性
       leaderEpoch = partitionState.leaderEpoch
       leaderEpochStartOffsetOpt = None
       zkVersion = partitionState.zkVersion
 
       // Since we might have been a leader previously, still clear any pending AlterIsr requests
+      // 清除任何挂起的 AlterIsr 请求，并检查副本状态
       alterIsrManager.clearPending(topicPartition)
 
+      // 如果该副本之前就是 Leader，且被迫放弃领导权，返回 false；否则返回 true。
       if (leaderReplicaIdOpt.contains(newLeaderBrokerId) && leaderEpoch == oldLeaderEpoch) {
         false
       } else {
+        // 重置 Leader 副本的 Broker ID
         leaderReplicaIdOpt = Some(newLeaderBrokerId)
         true
       }
@@ -697,23 +732,30 @@ class Partition(val topicPartition: TopicPartition,
                                followerStartOffset: Long,
                                followerFetchTimeMs: Long,
                                leaderEndOffset: Long): Boolean = {
+    // 从 Partition#remoteReplicasMap 中获取副本对应的 Replica 实例。
     getReplica(followerId) match {
       case Some(followerReplica) =>
         // No need to calculate low watermark if there is no delayed DeleteRecordsRequest
         val oldLeaderLW = if (delayedOperations.numDelayedDelete > 0) lowWatermarkIfLeader else -1L
         val prevFollowerEndOffset = followerReplica.logEndOffset
+        // 更新 Replica 实例，包括 logStartOffset、logEndOffsetMetadata 等属性。
+        // 由于更新了 Follower 的 logEndOffset 属性，所以分区的高水位也可能需要更新。
         followerReplica.updateFetchState(
           followerFetchOffsetMetadata,
           followerStartOffset,
           followerFetchTimeMs,
           leaderEndOffset)
 
+        // oldLeaderLW 、newLeaderLW 这两个变量是更新分区数据前后的低水位。
+        // 这里的低水位是指：该分区所有副本中同步最落后的副本的 logStartOffset 偏移量。
         val newLeaderLW = if (delayedOperations.numDelayedDelete > 0) lowWatermarkIfLeader else -1L
         // check if the LW of the partition has incremented
         // since the replica's logStartOffset may have incremented
+        // 更新分区高水位
         val leaderLWIncremented = newLeaderLW > oldLeaderLW
 
         // Check if this in-sync replica needs to be added to the ISR.
+        // 扩容 ISR
         maybeExpandIsr(followerReplica, followerFetchTimeMs)
 
         // check if the HW of the partition can now be incremented
@@ -725,6 +767,10 @@ class Partition(val topicPartition: TopicPartition,
         }
 
         // some delayed operations may be unblocked after HW or LW changed
+        // 如果分区的低水位或者高水位发生了变化，则触发该分区生产者的延迟操作的正常结束行为。
+        // 如果生产者设置了 acks = -1，则写入消息时，会创建一个延迟操作，
+        // 该延迟操作需要等待 ISR 中所有副本同步数据后再返回成功响应给生产者。
+        // 如果高水位发生变化则表示 ISR 中 Follower 副本同步了新数据，此时触发对应的生产者延迟操作的正常结束行为。
         if (leaderLWIncremented || leaderHWIncremented)
           tryCompleteDelayedRequests()
 
@@ -888,21 +934,30 @@ class Partition(val topicPartition: TopicPartition,
     inReadLock(leaderIsrUpdateLock) {
       // maybeIncrementLeaderHW is in the hot path, the following code is written to
       // avoid unnecessary collection generation
+      // 初始新的高水位线为 Leader 副本的 LEO
       var newHighWatermark = leaderLog.logEndOffsetMetadata
+      // 遍历所有的远端副本
       remoteReplicasMap.values.foreach { replica =>
         // Note here we are using the "maximal", see explanation above
+        // follower 副本在 ISR 副本集合中，follower 副本上次发送的 Fetch 请求距今时间小于 replicaLagTimeMaxMs
+        // 属性值（因为这些 follower 副本后续会添加到 ISR 副本集合中，所以需要考虑这些 follower 副本），
+        // 则将新高水位线更新为该副本的 LEO。
         if (replica.logEndOffsetMetadata.messageOffset < newHighWatermark.messageOffset &&
           (curTime - replica.lastCaughtUpTimeMs <= replicaLagTimeMaxMs || isrState.maximalIsr.contains(replica.brokerId))) {
+          // follower 副本的最小 LEO 作为高水位值
           newHighWatermark = replica.logEndOffsetMetadata
         }
       }
 
+      // 尝试通过新的高水位线更新 Leader 副本的高水位线
       leaderLog.maybeIncrementHighWatermark(newHighWatermark) match {
         case Some(oldHighWatermark) =>
           debug(s"High watermark updated from $oldHighWatermark to $newHighWatermark")
+          // 更新成功
           true
 
         case None =>
+          // 如果更新失败，打印日志以及当前的所有 LEO 信息
           def logEndOffsetString: ((Int, LogOffsetMetadata)) => String = {
             case (brokerId, logEndOffsetMetadata) => s"replica $brokerId: $logEndOffsetMetadata"
           }
@@ -913,6 +968,7 @@ class Partition(val topicPartition: TopicPartition,
             trace(s"Skipping update high watermark since new hw $newHighWatermark is not larger than old value. " +
               s"All current LEOs are ${(replicaInfo + localLogInfo).map(logEndOffsetString)}")
           }
+          // 更新失败
           false
       }
     }
@@ -950,37 +1006,49 @@ class Partition(val topicPartition: TopicPartition,
   private def tryCompleteDelayedRequests(): Unit = delayedOperations.checkAndCompleteAll()
 
   def maybeShrinkIsr(): Unit = {
+    // 判断是否需要执行 ISR 收缩
     val needsIsrUpdate = !isrState.isInflight && inReadLock(leaderIsrUpdateLock) {
       needsShrinkIsr()
     }
     val leaderHWIncremented = needsIsrUpdate && inWriteLock(leaderIsrUpdateLock) {
+      // 如果是 Leader 副本
       leaderLogIfLocal.exists { leaderLog =>
+        // 获取不同步的副本 Id 列表
         val outOfSyncReplicaIds = getOutOfSyncReplicas(replicaLagTimeMaxMs)
+        // 如果存在不同步的副本 Id 列表
         if (outOfSyncReplicaIds.nonEmpty) {
+          // 获取不同步的的副本日志
           val outOfSyncReplicaLog = outOfSyncReplicaIds.map { replicaId =>
             s"(brokerId: $replicaId, endOffset: ${getReplicaOrException(replicaId).logEndOffset})"
           }.mkString(" ")
+          // 计算收缩之后的 ISR 列表:把它们从当前 ISR 中剔除出去，然后计算得出最新的 ISR 列表
           val newIsrLog = (isrState.isr -- outOfSyncReplicaIds).mkString(",")
           info(s"Shrinking ISR from ${isrState.isr.mkString(",")} to $newIsrLog. " +
                s"Leader: (highWatermark: ${leaderLog.highWatermark}, endOffset: ${leaderLog.logEndOffset}). " +
                s"Out of sync replicas: $outOfSyncReplicaLog.")
 
+          // 更新 ZooKeeper 中分区的 ISR 数据以及 Broker 的元数据缓存中的数据
           shrinkIsr(outOfSyncReplicaIds)
 
           // we may need to increment high watermark since ISR could be down to 1
+          // 尝试更新 Leader 副本的高水位值
           maybeIncrementLeaderHW(leaderLog)
         } else {
+          // 如果没有不同步的副本 Id 列表，什么都不做
           false
         }
       }
     }
 
     // some delayed operations may be unblocked after HW changed
+    // 如果 Leader 副本的高水位值已经抬高了
     if (leaderHWIncremented)
+    // 尝试解锁一下延迟请求
       tryCompleteDelayedRequests()
   }
 
   private def needsShrinkIsr(): Boolean = {
+    // 获取与 Leader 不同步的副本
     leaderLogIfLocal.exists { _ => getOutOfSyncReplicas(replicaLagTimeMaxMs).nonEmpty }
   }
 
@@ -1340,6 +1408,7 @@ class Partition(val topicPartition: TopicPartition,
     }
   }
 
+  // 把 isr 的改变通知给 Controller 节点，然后 Controller 节点再把 isr 的信息通知给其他的 broker节点
   private[cluster] def expandIsr(newInSyncReplica: Int): Unit = {
     if (useAlterIsr) {
       expandIsrWithAlterIsr(newInSyncReplica)
@@ -1413,6 +1482,7 @@ class Partition(val topicPartition: TopicPartition,
   }
 
   private def sendAlterIsrRequest(proposedIsrState: IsrState): Unit = {
+    // 构建要发送的 isr 信息集合
     val isrToSend: Set[Int] = proposedIsrState match {
       case PendingExpandIsr(isr, newInSyncReplicaId) => isr + newInSyncReplicaId
       case PendingShrinkIsr(isr, outOfSyncReplicaIds) => isr -- outOfSyncReplicaIds
@@ -1420,7 +1490,9 @@ class Partition(val topicPartition: TopicPartition,
         throw new IllegalStateException(s"Invalid state $state for `AlterIsr` request for partition $topicPartition")
     }
 
+    // 需要把 Leader 信息和 isr 信息整合在一起发送
     val newLeaderAndIsr = new LeaderAndIsr(localBrokerId, leaderEpoch, isrToSend.toList, zkVersion)
+    // 进一步完善发送信息，增加 isr 对应的主题分区
     val alterIsrItem = AlterIsrItem(topicPartition, newLeaderAndIsr, handleAlterIsrResponse(proposedIsrState))
 
     if (!alterIsrManager.enqueue(alterIsrItem)) {

@@ -110,9 +110,13 @@ private[timer] class TimingWheel(tickMs: Long, wheelSize: Int, startMs: Long, ta
 
   private[this] def addOverflowWheel(): Unit = {
     synchronized {
+      // 只有之前没有创建上层时间轮方法才会继续
       if (overflowWheel == null) {
+        // 创建新的 TimingWheel 实例
         overflowWheel = new TimingWheel(
+          // tickMs 等于下层时间轮总时长
           tickMs = interval,
+          // 每层的轮子数都是相同的
           wheelSize = wheelSize,
           startMs = currentTime,
           taskCounter = taskCounter,
@@ -123,43 +127,58 @@ private[timer] class TimingWheel(tickMs: Long, wheelSize: Int, startMs: Long, ta
   }
 
   def add(timerTaskEntry: TimerTaskEntry): Boolean = {
+    // 首先获取定时任务的过期时间戳
     val expiration = timerTaskEntry.expirationMs
 
+    // 如果该任务已然被取消了，直接返回
     if (timerTaskEntry.cancelled) {
       // Cancelled
       false
+      // 如果该任务超时时间已过期，直接返回
     } else if (expiration < currentTime + tickMs) {
       // Already expired
       false
+      // 如果该任务超时时间在本层时间轮覆盖时间范围内
     } else if (expiration < currentTime + interval) {
       // Put in its own bucket
+      // 计算 bucket 的虚拟 id
       val virtualId = expiration / tickMs
+      // 计算要被放入到哪个 Bucket 中
       val bucket = buckets((virtualId % wheelSize.toLong).toInt)
+      // 将 timerTaskEntry 添加到 Bucket 中
       bucket.add(timerTaskEntry)
 
       // Set the bucket expiration time
+      // 如果 Bucket 的到期时间没有设置，则设置到期时间
       if (bucket.setExpiration(virtualId * tickMs)) {
         // The bucket needs to be enqueued because it was an expired bucket
         // We only need to enqueue the bucket when its expiration time has changed, i.e. the wheel has advanced
         // and the previous buckets gets reused; further calls to set the expiration within the same wheel cycle
         // will pass in the same value and hence return false, thus the bucket with the same expiration will not
         // be enqueued multiple times.
+        // 如果该时间变更过，说明 Bucket 是新建或被重用，将其加回到 DelayQueue
         queue.offer(bucket)
       }
       true
     } else {
       // Out of the interval. Put it into the parent timer
+      // 如果定时任务的过期时间无法被涵盖在本层时间轮中，交由上层时间轮处理
+      // 如果 overflowWheel 为空，则按需创建上层时间轮
       if (overflowWheel == null) addOverflowWheel()
+      // 将 timerTaskEntry 加入到上层时间轮中
       overflowWheel.add(timerTaskEntry)
     }
   }
 
   // Try to advance the clock
   def advanceClock(timeMs: Long): Unit = {
+    // 判断时间 timeMs 是否大于等于当前时间加上时间间隔 tickMs，即要超过当前 Bucket 的时间范围
     if (timeMs >= currentTime + tickMs) {
+      // 更新当前时间 currentTime 到下一个 Bucket 的起始时点
       currentTime = timeMs - (timeMs % tickMs)
 
       // Try to advance the clock of the overflow wheel if present
+      // 同时尝试为上一层时间轮做向前推进操作
       if (overflowWheel != null) overflowWheel.advanceClock(currentTime)
     }
   }

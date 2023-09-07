@@ -166,6 +166,7 @@ class ReplicaAlterLogDirsThread(name: String,
         val endOffset = if (epochData.leaderEpoch == UNDEFINED_EPOCH) {
           new EpochEndOffset(UNDEFINED_EPOCH, UNDEFINED_EPOCH_OFFSET)
         } else {
+          // 获取分区对象
           val partition = replicaMgr.getPartitionOrException(tp)
           partition.lastOffsetForLeaderEpoch(
             currentLeaderEpoch = epochData.currentLeaderEpoch,

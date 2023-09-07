@@ -59,8 +59,11 @@ public class PartitionStates<S> {
     }
 
     public void updateAndMoveToEnd(TopicPartition topicPartition, S state) {
+        // 先移除分区
         map.remove(topicPartition);
+        // 再插入进去，此时该分区就排在最后一位了
         map.put(topicPartition, state);
+        // 更新集合大小
         updateSize();
     }
 

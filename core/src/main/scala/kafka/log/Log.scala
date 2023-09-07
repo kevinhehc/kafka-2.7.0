@@ -585,14 +585,18 @@ class Log(@volatile private var _dir: File, // 当前日志目录
 
   def recordVersion: RecordVersion = config.messageFormatVersion.recordVersion
 
+  // 从 leader-epoch-checkpoint 文件中加载 LeaderEpoch 信息并存储到 LeaderEpochFileCache#epochs 中。
   private def initializeLeaderEpochCache(): Unit = lock synchronized {
+    // 创建用于存储 Leader Epoch 的检查点文件
     val leaderEpochFile = LeaderEpochCheckpointFile.newFile(dir)
 
+    // 创建新的 Leader Epoch 文件缓存
     def newLeaderEpochFileCache(): LeaderEpochFileCache = {
       val checkpointFile = new LeaderEpochCheckpointFile(leaderEpochFile, logDirFailureChannel)
       new LeaderEpochFileCache(topicPartition, () => logEndOffset, checkpointFile)
     }
 
+    // 如果记录版本在 V2 之前，则删除旧的 Leader Epoch 缓存，并删除检查点文件
     if (recordVersion.precedes(RecordVersion.V2)) {
       val currentCache = if (leaderEpochFile.exists())
         Some(newLeaderEpochFileCache())
@@ -602,9 +606,11 @@ class Log(@volatile private var _dir: File, // 当前日志目录
       if (currentCache.exists(_.nonEmpty))
         warn(s"Deleting non-empty leader epoch cache due to incompatible message format $recordVersion")
 
+      // 如果当前缓存非空，则警告删除非空的 Leader Epoch 缓存，因为与不兼容的消息格式(recordVersion)有关
       Files.deleteIfExists(leaderEpochFile.toPath)
       leaderEpochCache = None
     } else {
+      // 创建新的 Leader Epoch 缓存
       leaderEpochCache = Some(newLeaderEpochFileCache())
     }
   }

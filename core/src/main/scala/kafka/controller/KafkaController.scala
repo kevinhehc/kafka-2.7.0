@@ -314,7 +314,9 @@ class KafkaController(val config: KafkaConfig,
 
     // 启动 Replica State Machine 和 Partition State Machine。Replica State Machine 用于处理副本相关的操作，
     // Partition State Machine 用于处理分区相关的操作。
+    // 启动副本状态机
     replicaStateMachine.startup()
+    // 启动分区状态机
     partitionStateMachine.startup()
 
     info(s"Ready to serve as the new controller with epoch $epoch")

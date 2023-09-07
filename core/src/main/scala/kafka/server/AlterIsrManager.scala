@@ -87,6 +87,7 @@ class AlterIsrManagerImpl(val controllerChannelManager: BrokerToControllerChanne
   }
 
   private def sendRequest(inflightAlterIsrItems: Seq[AlterIsrItem]): Unit = {
+    // 构建发送 isr 信息
     val message = buildRequest(inflightAlterIsrItems)
     def responseHandler(response: ClientResponse): Unit = {
       try {
@@ -101,6 +102,7 @@ class AlterIsrManagerImpl(val controllerChannelManager: BrokerToControllerChanne
     }
 
     debug(s"Sending AlterIsr to controller $message")
+    // 向 controller 发送 isr 信息。
     controllerChannelManager.sendRequest(new AlterIsrRequest.Builder(message), responseHandler)
   }
 
