@@ -136,6 +136,7 @@ class TransactionMarkerChannelManager(config: KafkaConfig,
 
   private val interBrokerListenerName: ListenerName = config.interBrokerListenerName
 
+  // 存储了每个 Broker 节点与待发送给该 Broker 的 WriteTxnMarkers 请求
   private val markersQueuePerBroker: concurrent.Map[Int, TxnMarkerQueue] = new ConcurrentHashMap[Int, TxnMarkerQueue]().asScala
 
   private val markersQueueForUnknownBroker = new TxnMarkerQueue(Node.noNode)
@@ -169,11 +170,14 @@ class TransactionMarkerChannelManager(config: KafkaConfig,
 
     // we do not synchronize on the update of the broker node with the enqueuing,
     // since even if there is a race condition we will just retry
+    // 获取指定 broker 的事务标记队列，如果不存在则创建一个新的队列
     val brokerRequestQueue = CoreUtils.atomicGetOrUpdate(markersQueuePerBroker, brokerId,
         new TxnMarkerQueue(broker))
     brokerRequestQueue.destination = broker
+    // 将事务标记添加到指定 broker 的队列中
     brokerRequestQueue.addMarkers(txnTopicPartition, txnIdAndMarker)
 
+    // 记录日志，表示成功添加了事务标记
     trace(s"Added marker ${txnIdAndMarker.txnMarkerEntry} for transactional id ${txnIdAndMarker.txnId} to destination broker $brokerId")
   }
 
@@ -329,44 +333,55 @@ class TransactionMarkerChannelManager(config: KafkaConfig,
                                  result: TransactionResult,
                                  coordinatorEpoch: Int,
                                  topicPartitions: immutable.Set[TopicPartition]): Unit = {
+    // 获取事务主题分区
     val txnTopicPartition = txnStateManager.partitionFor(transactionalId)
+    // 将主题分区按照目标节点分组
     val partitionsByDestination: immutable.Map[Option[Node], immutable.Set[TopicPartition]] = topicPartitions.groupBy { topicPartition: TopicPartition =>
+      // 获取主题分区的 Leader 副本节点
       metadataCache.getPartitionLeaderEndpoint(topicPartition.topic, topicPartition.partition, interBrokerListenerName)
     }
 
+    // 遍历按目标节点分组后的主题分区集合
     for ((broker: Option[Node], topicPartitions: immutable.Set[TopicPartition]) <- partitionsByDestination) {
       broker match {
         case Some(brokerNode) =>
+          // 创建事务标记对象
           val marker = new TxnMarkerEntry(producerId, producerEpoch, coordinatorEpoch, result, topicPartitions.toList.asJava)
           val txnIdAndMarker = TxnIdAndMarkerEntry(transactionalId, marker)
 
           if (brokerNode == Node.noNode) {
             // if the leader of the partition is known but node not available, put it into an unknown broker queue
             // and let the sender thread to look for its broker and migrate them later
+            // 如果分区的 Leader 节点已知但不可用，将事务标记添加到未知节点的队列中，等待发送线程查找可用节点并进行迁移
             markersQueueForUnknownBroker.addMarkers(txnTopicPartition, txnIdAndMarker)
           } else {
+            // 将事务标记添加到对应的节点的队列中
             addMarkersForBroker(brokerNode, txnTopicPartition, txnIdAndMarker)
           }
 
         case None =>
           txnStateManager.getTransactionState(transactionalId) match {
             case Left(error) =>
+              // 获取事务元数据失败，取消向分区 Leader 副本节点发送事务标记
               info(s"Encountered $error trying to fetch transaction metadata for $transactionalId with coordinator epoch $coordinatorEpoch; cancel sending markers to its partition leaders")
               transactionsWithPendingMarkers.remove(transactionalId)
 
             case Right(Some(epochAndMetadata)) =>
               if (epochAndMetadata.coordinatorEpoch != coordinatorEpoch) {
+                // 当准备发送事务标记时，缓存的元数据已经发生变化，取消向分区 Leader 副本节点发送事务标记
                 info(s"The cached metadata has changed to $epochAndMetadata (old coordinator epoch is $coordinatorEpoch) since preparing to send markers; cancel sending markers to its partition leaders")
                 transactionsWithPendingMarkers.remove(transactionalId)
               } else {
                 // if the leader of the partition is unknown, skip sending the txn marker since
                 // the partition is likely to be deleted already
+                // 分区 Leader 副本节点未知，跳过发送事务标记，因为该分区很可能已被删除
                 info(s"Couldn't find leader endpoint for partitions $topicPartitions while trying to send transaction markers for " +
                   s"$transactionalId, these partitions are likely deleted already and hence can be skipped")
 
                 val txnMetadata = epochAndMetadata.transactionMetadata
 
                 txnMetadata.inLock {
+                  // 从事务元数据中移除对应的主题分区
                   topicPartitions.foreach(txnMetadata.removePartition)
                 }
 
@@ -374,6 +389,7 @@ class TransactionMarkerChannelManager(config: KafkaConfig,
               }
 
             case Right(None) =>
+              // 协调器仍然拥有事务分区，但缓存中没有元数据，这是不正常的情况
               val errorMsg = s"The coordinator still owns the transaction partition for $transactionalId, but there is " +
                 s"no metadata in the cache; this is not expected"
               fatal(errorMsg)
@@ -383,6 +399,7 @@ class TransactionMarkerChannelManager(config: KafkaConfig,
       }
     }
 
+    // 唤醒发送线程
     wakeup()
   }
 

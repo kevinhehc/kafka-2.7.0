@@ -1441,6 +1441,7 @@ class Log(@volatile private var _dir: File, // 当前日志目录
         // 更新事务索引状态
         for (completedTxn <- completedTxns) {
           val lastStableOffset = producerStateManager.lastStableOffset(completedTxn)
+          // 会调用 logSegment#updateTxnIndex 方法
           segment.updateTxnIndex(completedTxn, lastStableOffset)
           producerStateManager.completeTxn(completedTxn)
         }
@@ -1497,6 +1498,8 @@ class Log(@volatile private var _dir: File, // 当前日志目录
       case other => other
     }
 
+    // 更新 Log#firstUnstableOffsetMetadata，它的取值规则：取生产者管理状态中的第一个不稳定偏移量的
+    // 偏移量 logOffsetMetadata.messageOffset 和日志的基准偏移量 logStartOffset 之间较大的那个。
     if (updatedFirstStableOffset != this.firstUnstableOffsetMetadata) {
       debug(s"First unstable offset updated to $updatedFirstStableOffset")
       this.firstUnstableOffsetMetadata = updatedFirstStableOffset
@@ -1536,6 +1539,7 @@ class Log(@volatile private var _dir: File, // 当前日志目录
     val completedTxns = ListBuffer.empty[CompletedTxn]
     var relativePositionInSegment = appendOffsetMetadata.relativePositionInSegment
 
+    // 遍历所有的消息批次进行处理
     for (batch <- records.batches.asScala) {
       if (batch.hasProducerId) {
         val maybeLastEntry = producerStateManager.lastEntry(batch.producerId)
@@ -1543,6 +1547,8 @@ class Log(@volatile private var _dir: File, // 当前日志目录
         // if this is a client produce request, there will be up to 5 batches which could have been duplicated.
         // If we find a duplicate, we return the metadata of the appended batch to the client.
         if (origin == AppendOrigin.Client) {
+          // 获取该批次的生产者元数据 producerStateEntry
+          // 调用 findDuplicateBatch 来查找重复的消息批次
           maybeLastEntry.flatMap(_.findDuplicateBatch(batch)).foreach { duplicate =>
             return (updatedProducers, completedTxns.toList, Some(duplicate))
           }
@@ -1555,7 +1561,9 @@ class Log(@volatile private var _dir: File, // 当前日志目录
         else
           None
 
+        // 调用 updateProducers 方法，以消息生产者为维度，将消息的事务信息分组汇总存储到不同的 ProducerAppendInfo 中。
         val maybeCompletedTxn = updateProducers(batch, updatedProducers, firstOffsetMetadata, origin)
+        // 将上一步得到的 completedTxn 实例添加到 completedTxns 集合中。
         maybeCompletedTxn.foreach(completedTxns += _)
       }
 
@@ -1673,8 +1681,11 @@ class Log(@volatile private var _dir: File, // 当前日志目录
                               producers: mutable.Map[Long, ProducerAppendInfo],
                               firstOffsetMetadata: Option[LogOffsetMetadata],
                               origin: AppendOrigin): Option[CompletedTxn] = {
+    // 获取生产者id
     val producerId = batch.producerId
+    // 从 updateProducers 集合中查找该消息批次生产者对应的 ProducerAppendInfo 实例，如果不存在则创建
     val appendInfo = producers.getOrElseUpdate(producerId, producerStateManager.prepareUpdate(producerId, origin))
+    // 调用 ProducerAppendInfo#append 方法将该消息批次的事务消息添加到 ProducerAppendInfo 中
     appendInfo.append(batch, firstOffsetMetadata)
   }
 
@@ -1831,11 +1842,18 @@ class Log(@volatile private var _dir: File, // 当前日志目录
     allAbortedTxns.toList
   }
 
+  // 添加未提交的事务到 FetchDataInfo 中
+  // startOffset 当前拉取的起始偏移量
+  // segmentEntry 当前段的JEntry对象，包含段的元数据和实例对象
+  // fetchInfo 当前拉取的数据信息
   private def addAbortedTransactions(startOffset: Long, segmentEntry: JEntry[JLong, LogSegment],
                                      fetchInfo: FetchDataInfo): FetchDataInfo = {
+    // 获取当前拉取的消息大小
     val fetchSize = fetchInfo.records.sizeInBytes
+    // 获取拉取的起始偏移量的位置信息
     val startOffsetPosition = OffsetPosition(fetchInfo.fetchOffsetMetadata.messageOffset,
       fetchInfo.fetchOffsetMetadata.relativePositionInSegment)
+    // 计算拉取数据的上界偏移量，不得超过段的末尾。如果超过了末尾，则使用下一个段的基准偏移量作为拉取的上界偏移量
     val upperBoundOffset = segmentEntry.getValue.fetchUpperBoundOffset(startOffsetPosition, fetchSize).getOrElse {
       val nextSegmentEntry = segments.higherEntry(segmentEntry.getKey)
       if (nextSegmentEntry != null)
@@ -1844,10 +1862,14 @@ class Log(@volatile private var _dir: File, // 当前日志目录
         logEndOffset
     }
 
+    // 创建一个 ListBuffer，用来存储未提交的事务
     val abortedTransactions = ListBuffer.empty[AbortedTransaction]
+    // 定义一个累加器函数，将 AbortedTxn 转换为 AbortedTransaction 并添加到 abortedTransactions 中
     def accumulator(abortedTxns: List[AbortedTxn]): Unit = abortedTransactions ++= abortedTxns.map(_.asAbortedTransaction)
+    // 收集起始偏移量和上界偏移量之间的未提交事务
     collectAbortedTransactions(startOffset, upperBoundOffset, segmentEntry, accumulator)
 
+    // 构造并返回包含未提交事务的FetchDataInfo对象
     FetchDataInfo(fetchOffsetMetadata = fetchInfo.fetchOffsetMetadata,
       records = fetchInfo.records,
       firstEntryIncomplete = fetchInfo.firstEntryIncomplete,

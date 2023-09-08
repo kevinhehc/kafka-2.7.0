@@ -284,6 +284,7 @@ class LogSegment private[log] (val log: FileRecords,
 
   @nonthreadsafe
   def updateTxnIndex(completedTxn: CompletedTxn, lastStableOffset: Long): Unit = {
+    // 如果事务被回滚，则将事务消息追加到 LogSegment#txnIndex 中
     if (completedTxn.isAborted) {
       trace(s"Writing aborted transaction $completedTxn to transaction index, last stable offset is $lastStableOffset")
       txnIndex.append(new AbortedTxn(completedTxn, lastStableOffset))

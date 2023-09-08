@@ -136,12 +136,16 @@ private[log] class ProducerStateEntry(val producerId: Long,
     if (batch.producerEpoch != producerEpoch)
        None
     else
+    // 比对消息是否重复
       batchWithSequenceRange(batch.baseSequence, batch.lastSequence)
   }
 
   // Return the batch metadata of the cached batch having the exact sequence range, if any.
   def batchWithSequenceRange(firstSeq: Int, lastSeq: Int): Option[BatchMetadata] = {
+    // 在 ProducerStateEntry#batchMetadata 中存储了该生产者最新发生的 5 个消息批次的序号
     val duplicate = batchMetadata.filter { metadata =>
+      // 如果该集合中存在某个消息批次与请求的消息批次的 baseSequence 即第一条消息的序号，lastSequence 即最后一条的消息的序号相等，
+      // 则可以认为生产者发送的消息批次重复发送，然后忽略即可。
       firstSeq == metadata.firstSeq && lastSeq == metadata.lastSeq
     }
     duplicate.headOption
@@ -241,18 +245,27 @@ private[log] class ProducerAppendInfo(val topicPartition: TopicPartition,
   }
 
   def append(batch: RecordBatch, firstOffsetMetadataOpt: Option[LogOffsetMetadata]): Option[CompletedTxn] = {
+    // 如果是控制批次
     if (batch.isControlBatch) {
+      // 获取批次中的消息迭代器。
       val recordIterator = batch.iterator
+      // 检查消息迭代器是否还有下一个元素。
       if (recordIterator.hasNext) {
+        // 如果有下一个元素，获取下一个元素作为记录。
         val record = recordIterator.next()
+        // 将记录反序列化为结束事务标记对象。
         val endTxnMarker = EndTransactionMarker.deserialize(record)
+        // 根据结束事务标记的信息，执行将标记追加到日志中的操作。
         val completedTxn = appendEndTxnMarker(endTxnMarker, batch.producerEpoch, batch.baseOffset, record.timestamp)
         Some(completedTxn)
       } else {
         // An empty control batch means the entire transaction has been cleaned from the log, so no need to append
+        // 如果控制批次为空，则表示整个事务已从日志中清除，无需追加任何内容，
         None
       }
     } else {
+      // 如果不是控制批次
+      // 获取第一个偏移量元数据信息，如果参数 firstOffsetMetadataOpt 中没有值，则使用批次的baseOffset 作为默认值。
       val firstOffsetMetadata = firstOffsetMetadataOpt.getOrElse(LogOffsetMetadata(batch.baseOffset))
       appendDataBatch(batch.producerEpoch, batch.baseSequence, batch.lastSequence, batch.maxTimestamp,
         firstOffsetMetadata, batch.lastOffset, batch.isTransactional)
@@ -260,6 +273,7 @@ private[log] class ProducerAppendInfo(val topicPartition: TopicPartition,
     }
   }
 
+  // 添加消息批次
   def appendDataBatch(epoch: Short,
                       firstSeq: Int,
                       lastSeq: Int,
@@ -268,18 +282,25 @@ private[log] class ProducerAppendInfo(val topicPartition: TopicPartition,
                       lastOffset: Long,
                       isTransactional: Boolean): Unit = {
     val firstOffset = firstOffsetMetadata.messageOffset
+    // 校验批次
     maybeValidateDataBatch(epoch, firstSeq, firstOffset)
+    // 添加批次
     updatedEntry.addBatch(epoch, lastSeq, lastOffset, (lastOffset - firstOffset).toInt, lastTimestamp)
 
+    // 匹配该批次是否是当前事务第一条消息批次
     updatedEntry.currentTxnFirstOffset match {
+      // 如果 isTransactional = false 直接抛异常
       case Some(_) if !isTransactional =>
         // Received a non-transactional message while a transaction is active
         throw new InvalidTxnStateException(s"Expected transactional write from producer $producerId at " +
           s"offset $firstOffsetMetadata in partition $topicPartition")
 
+      // 如果 isTransactional = true 表示属于事务消息
       case None if isTransactional =>
         // Began a new transaction
+        // 将该消息批次的第一条消息偏移量存储到
         updatedEntry.currentTxnFirstOffset = Some(firstOffset)
+        // 创建该事务对应的 TxnMetadata 实例并添加到 ProducerAppendInfo#transactions 中
         transactions += TxnMetadata(producerId, firstOffsetMetadata)
 
       case _ => // nothing to do
@@ -300,6 +321,7 @@ private[log] class ProducerAppendInfo(val topicPartition: TopicPartition,
     }
   }
 
+  // 追加结束事务标记
   def appendEndTxnMarker(endTxnMarker: EndTransactionMarker,
                          producerEpoch: Short,
                          offset: Long,
@@ -725,13 +747,17 @@ class ProducerStateManager(val topicPartition: TopicPartition,
    * Mark a transaction as completed. We will still await advancement of the high watermark before
    * advancing the first unstable offset.
    */
+
+  // 将事务从 ongoingTxns 转移到 unreplicatedTxns 中，表示事务已经完成，等待从节点同步复制
   def completeTxn(completedTxn: CompletedTxn): Unit = {
+    // 从 ongoingTxns 将已完成事务的首条偏移移除
     val txnMetadata = ongoingTxns.remove(completedTxn.firstOffset)
     if (txnMetadata == null)
       throw new IllegalArgumentException(s"Attempted to complete transaction $completedTxn on partition $topicPartition " +
         s"which was not started")
-
+    // 计算最后一条偏移量
     txnMetadata.lastOffset = Some(completedTxn.lastOffset)
+    // 给 unreplicatedTxns 添加已完成事务的首条偏移
     unreplicatedTxns.put(completedTxn.firstOffset, txnMetadata)
   }
 

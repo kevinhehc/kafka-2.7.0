@@ -410,18 +410,23 @@ public class Sender implements Runnable {
      * Returns true if a transactional request is sent or polled, or if a FindCoordinator request is enqueued
      */
     private boolean maybeSendAndPollTransactionalRequest() {
+        // 如果存在未完成的事务请求，等待其返回
         if (transactionManager.hasInFlightRequest()) {
             // as long as there are outstanding transactional requests, we simply wait for them to return
             client.poll(retryBackoffMs, time.milliseconds());
             return true;
         }
 
+        // 如果事务管理器存在可中止的错误或者正在中止中，且累加器包含未完成的消息批次，则终止未完成的消息批次
         if (transactionManager.hasAbortableError() || transactionManager.isAborting()) {
             if (accumulator.hasIncomplete()) {
                 // Attempt to get the last error that caused this abort.
+                // 尝试获取导致事务中止的最后一个错误
                 RuntimeException exception = transactionManager.lastError();
                 // If there was no error, but we are still aborting,
                 // then this is most likely a case where there was no fatal error.
+                // 如果没有错误但是仍在中止中，
+                // 则这很可能是没有致命错误的情况
                 if (exception == null) {
                     exception = new TransactionAbortedException();
                 }
@@ -429,42 +434,57 @@ public class Sender implements Runnable {
             }
         }
 
+        // 3、如果事务管理器正在完成事务且累加器没有正在进行的刷新操作，开始执行刷新操作
         if (transactionManager.isCompleting() && !accumulator.flushInProgress()) {
             // There may still be requests left which are being retried. Since we do not know whether they had
             // been successfully appended to the broker log, we must resend them until their final status is clear.
             // If they had been appended and we did not receive the error, then our sequence number would no longer
             // be correct which would lead to an OutOfSequenceException.
+            // 可能仍有请求在重试中。由于我们不知道它们是否已经成功添加到代理程序日志中，
+            // 我们必须重发它们，直到其最终状态明确为止。
+            // 如果它们已经被添加但我们没有接收到错误，那么我们的序列号将不再正确，这将导致OutOfSequenceException。
             accumulator.beginFlush();
         }
 
+        // transactionManager.nextRequest 方法会从待处理请求队列中获取下一个 TxnRequestHandler
         TransactionManager.TxnRequestHandler nextRequestHandler = transactionManager.nextRequest(accumulator.hasIncomplete());
         if (nextRequestHandler == null)
             return false;
 
+        // 生成一个 requestBuilder，该 requestBuilder 负责生成下一个事务请求
         AbstractRequest.Builder<?> requestBuilder = nextRequestHandler.requestBuilder();
         Node targetNode = null;
         try {
+            // nextRequestHandler.CoordinatorType 方法返回下一个事务请求的目标节点类型
             FindCoordinatorRequest.CoordinatorType coordinatorType = nextRequestHandler.coordinatorType();
+            // 这里分为 3 种情况：
             targetNode = coordinatorType != null ?
                     transactionManager.coordinator(coordinatorType) :
                     client.leastLoadedNode(time.milliseconds());
+            // 如果目标节点未准备好，或者目标节点为空，则表示需要查找目标节点，此时调用 maybeFindCoordinatorAndRetry 方法生成一个
+            // FindCoordinatorHandler 放入待处理队列，并将上面获取到的 TxnRequestHandler  重新放入待处理请求队列，
+            // 以便获取目标节点成功后再处理该 handler。
             if (targetNode != null) {
                 if (!awaitNodeReady(targetNode, coordinatorType)) {
                     log.trace("Target node {} not ready within request timeout, will retry when node is ready.", targetNode);
+                    // 目标节点未就绪，等待一段时间后重试
                     maybeFindCoordinatorAndRetry(nextRequestHandler);
                     return true;
                 }
             } else if (coordinatorType != null) {
                 log.trace("Coordinator not known for {}, will retry {} after finding coordinator.", coordinatorType, requestBuilder.apiKey());
+                // 协调器未被发现，先发起协调器查找请求，然后重试
                 maybeFindCoordinatorAndRetry(nextRequestHandler);
                 return true;
             } else {
                 log.trace("No nodes available to send requests, will poll and retry when until a node is ready.");
+                // 没有可用的节点，等待一段时间后重试
                 transactionManager.retry(nextRequestHandler);
                 client.poll(retryBackoffMs, time.milliseconds());
                 return true;
             }
 
+            // 如果是重试请求，则进行休眠
             if (nextRequestHandler.isRetry())
                 time.sleep(nextRequestHandler.retryBackoffMs());
 
@@ -472,6 +492,7 @@ public class Sender implements Runnable {
             ClientRequest clientRequest = client.newClientRequest(
                 targetNode.idString(), requestBuilder, currentTimeMs, true, requestTimeoutMs, nextRequestHandler);
             log.debug("Sending transactional request {} to node {} with correlation ID {}", requestBuilder, targetNode, clientRequest.correlationId());
+            // 发送请求并等待响应
             client.send(clientRequest, currentTimeMs);
             transactionManager.setInFlightCorrelationId(clientRequest.correlationId());
             client.poll(retryBackoffMs, time.milliseconds());
@@ -480,6 +501,7 @@ public class Sender implements Runnable {
             log.debug("Disconnect from {} while trying to send request {}. Going " +
                     "to back off and retry.", targetNode, requestBuilder, e);
             // We break here so that we pick up the FindCoordinator request immediately.
+            // 发送请求时与目标节点断开连接，直接发起协调器查找请求，然后重试
             maybeFindCoordinatorAndRetry(nextRequestHandler);
             return true;
         }
@@ -487,13 +509,17 @@ public class Sender implements Runnable {
 
     private void maybeFindCoordinatorAndRetry(TransactionManager.TxnRequestHandler nextRequestHandler) {
         if (nextRequestHandler.needsCoordinator()) {
+            // 如果下一个请求处理需要协调器，则发起协调器查找请求
             transactionManager.lookupCoordinator(nextRequestHandler);
         } else {
             // For non-coordinator requests, sleep here to prevent a tight loop when no node is available
+            // 对于非协调器请求，睡眠一段时间以避免没有可用节点时出现紧密循环
             time.sleep(retryBackoffMs);
+            // 发送元数据更新请求以便获取最新的集群中的节点信息
             metadata.requestUpdate();
         }
 
+        // 对下一个请求的处理进行重试
         transactionManager.retry(nextRequestHandler);
     }
 

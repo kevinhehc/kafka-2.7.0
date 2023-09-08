@@ -31,47 +31,57 @@ class TransactionMarkerRequestCompletionHandler(brokerId: Int,
                                                 txnMarkerChannelManager: TransactionMarkerChannelManager,
                                                 txnIdAndMarkerEntries: java.util.List[TxnIdAndMarkerEntry]) extends RequestCompletionHandler with Logging {
 
+  // 设置日志标识
   this.logIdent = "[Transaction Marker Request Completion Handler " + brokerId + "]: "
 
   override def onComplete(response: ClientResponse): Unit = {
     val requestHeader = response.requestHeader
     val correlationId = requestHeader.correlationId
+    // 如果响应中断开了连接
     if (response.wasDisconnected) {
+      // 取消请求，并处理其关联的事务标记
       trace(s"Cancelled request with header $requestHeader due to node ${response.destination} being disconnected")
 
       for (txnIdAndMarker <- txnIdAndMarkerEntries.asScala) {
         val transactionalId = txnIdAndMarker.txnId
         val txnMarker = txnIdAndMarker.txnMarkerEntry
 
+        // 获取当前事务的状态
         txnStateManager.getTransactionState(transactionalId) match {
 
           case Left(Errors.NOT_COORDINATOR) =>
+            // 当前节点不再是该事务的协调器，取消发送事务标记
             info(s"I am no longer the coordinator for $transactionalId; cancel sending transaction markers $txnMarker to the brokers")
 
             txnMarkerChannelManager.removeMarkersForTxnId(transactionalId)
 
           case Left(Errors.COORDINATOR_LOAD_IN_PROGRESS) =>
+            // 加载包含该事务的分区，取消发送事务标记
             info(s"I am loading the transaction partition that contains $transactionalId which means the current markers have to be obsoleted; " +
               s"cancel sending transaction markers $txnMarker to the brokers")
 
             txnMarkerChannelManager.removeMarkersForTxnId(transactionalId)
 
           case Left(unexpectedError) =>
+            // 处理其他未处理的错误
             throw new IllegalStateException(s"Unhandled error $unexpectedError when fetching current transaction state")
 
           case Right(None) =>
+            // 协调器仍然拥有该事务分区，但缓存中没有元数据，这是不应该发生的
             throw new IllegalStateException(s"The coordinator still owns the transaction partition for $transactionalId, but there is " +
               s"no metadata in the cache; this is not expected")
 
           case Right(Some(epochAndMetadata)) =>
             if (epochAndMetadata.coordinatorEpoch != txnMarker.coordinatorEpoch) {
               // coordinator epoch has changed, just cancel it from the purgatory
+              // 协调器的epoch已经改变，取消发送事务标记
               info(s"Transaction coordinator epoch for $transactionalId has changed from ${txnMarker.coordinatorEpoch} to " +
                 s"${epochAndMetadata.coordinatorEpoch}; cancel sending transaction markers $txnMarker to the brokers")
 
               txnMarkerChannelManager.removeMarkersForTxnId(transactionalId)
             } else {
               // re-enqueue the markers with possibly new destination brokers
+              // 使用可能有新目标代理的方式重新排队标记
               trace(s"Re-enqueuing ${txnMarker.transactionResult} transaction markers for transactional id $transactionalId " +
                 s"under coordinator epoch ${txnMarker.coordinatorEpoch}")
 
@@ -85,6 +95,7 @@ class TransactionMarkerRequestCompletionHandler(brokerId: Int,
         }
       }
     } else {
+      // 接收到写入事务标记的响应
       debug(s"Received WriteTxnMarker response $response from node ${response.destination} with correlation id $correlationId")
 
       val writeTxnMarkerResponse = response.responseBody.asInstanceOf[WriteTxnMarkersResponse]
@@ -99,20 +110,24 @@ class TransactionMarkerRequestCompletionHandler(brokerId: Int,
 
         txnStateManager.getTransactionState(transactionalId) match {
           case Left(Errors.NOT_COORDINATOR) =>
+            // 当前节点不再是该事务的协调器，取消发送事务标记
             info(s"I am no longer the coordinator for $transactionalId; cancel sending transaction markers $txnMarker to the brokers")
 
             txnMarkerChannelManager.removeMarkersForTxnId(transactionalId)
 
           case Left(Errors.COORDINATOR_LOAD_IN_PROGRESS) =>
+            // 加载包含该事务的分区，取消发送事务标记
             info(s"I am loading the transaction partition that contains $transactionalId which means the current markers have to be obsoleted; " +
               s"cancel sending transaction markers $txnMarker to the brokers")
 
             txnMarkerChannelManager.removeMarkersForTxnId(transactionalId)
 
           case Left(unexpectedError) =>
+            // 处理其他未处理的错误
             throw new IllegalStateException(s"Unhandled error $unexpectedError when fetching current transaction state")
 
           case Right(None) =>
+            // 协调器仍然拥有该事务分区，但缓存中没有元数据，这是不应该发生的
             throw new IllegalStateException(s"The coordinator still owns the transaction partition for $transactionalId, but there is " +
               s"no metadata in the cache; this is not expected")
 
@@ -123,6 +138,7 @@ class TransactionMarkerRequestCompletionHandler(brokerId: Int,
 
             if (epochAndMetadata.coordinatorEpoch != txnMarker.coordinatorEpoch) {
               // coordinator epoch has changed, just cancel it from the purgatory
+              // 协调器的epoch已经改变，取消发送事务标记
               info(s"Transaction coordinator epoch for $transactionalId has changed from ${txnMarker.coordinatorEpoch} to " +
                 s"${epochAndMetadata.coordinatorEpoch}; cancel sending transaction markers $txnMarker to the brokers")
 
@@ -133,8 +149,10 @@ class TransactionMarkerRequestCompletionHandler(brokerId: Int,
                 for ((topicPartition, error) <- errors.asScala) {
                   error match {
                     case Errors.NONE =>
+                      // 从事务元数据中移除该分区
                       txnMetadata.removePartition(topicPartition)
 
+                    // 这些都是意外的且致命的错误
                     case Errors.CORRUPT_MESSAGE |
                          Errors.MESSAGE_TOO_LARGE |
                          Errors.RECORD_LIST_TOO_LARGE |
@@ -142,6 +160,7 @@ class TransactionMarkerRequestCompletionHandler(brokerId: Int,
 
                       throw new IllegalStateException(s"Received fatal error ${error.exceptionName} while sending txn marker for $transactionalId")
 
+                    // 这些是可重试的错误
                     case Errors.UNKNOWN_TOPIC_OR_PARTITION |
                          Errors.NOT_LEADER_OR_FOLLOWER |
                          Errors.NOT_ENOUGH_REPLICAS |
@@ -154,6 +173,7 @@ class TransactionMarkerRequestCompletionHandler(brokerId: Int,
 
                       retryPartitions += topicPartition
 
+                    // producer或coordinator的epoch已经改变，可以忽略该事务
                     case Errors.INVALID_PRODUCER_EPOCH |
                          Errors.TRANSACTION_COORDINATOR_FENCED => // producer or coordinator epoch has changed, this txn can now be ignored
 

@@ -592,10 +592,15 @@ public class KafkaProducer<K, V> implements Producer<K, V> {
      * @throws InterruptException if the thread is interrupted while blocked
      */
     public void initTransactions() {
+        // 检查是否存在TransactionManager
         throwIfNoTransactionManager();
+        // 检查Producer是否已关闭，如果关闭则抛出异常
         throwIfProducerClosed();
+        // 初始化事务并返回初始化结果
         TransactionalRequestResult result = transactionManager.initializeTransactions();
+        // 唤醒Producer线程
         sender.wakeup();
+        // 等待初始化结果，等待时间不超过最大阻塞时间
         result.await(maxBlockTimeMs, TimeUnit.MILLISECONDS);
     }
 
@@ -617,6 +622,7 @@ public class KafkaProducer<K, V> implements Producer<K, V> {
     public void beginTransaction() throws ProducerFencedException {
         throwIfNoTransactionManager();
         throwIfProducerClosed();
+        // 调用事务管理器来启动事务
         transactionManager.beginTransaction();
     }
 
@@ -729,8 +735,11 @@ public class KafkaProducer<K, V> implements Producer<K, V> {
     public void commitTransaction() throws ProducerFencedException {
         throwIfNoTransactionManager();
         throwIfProducerClosed();
+        // 发送 EndTxn 请求给协调者，EndTxn 请求中携带了 committed 标志，表示提交事务或者回滚事务，这里只关注提交事务处理过程
         TransactionalRequestResult result = transactionManager.beginCommit();
+        // 唤醒 Sender 线程，将 EndTxn 请求发送给协调者。
         sender.wakeup();
+        // 阻塞生产者，等待协调者返回 EndTxn 响应。
         result.await(maxBlockTimeMs, TimeUnit.MILLISECONDS);
     }
 
@@ -929,6 +938,7 @@ public class KafkaProducer<K, V> implements Producer<K, V> {
                         " to class " + producerConfig.getClass(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG).getName() +
                         " specified in value.serializer", cce);
             }
+            // 获取主题对应的分区
             int partition = partition(record, serializedKey, serializedValue, cluster);
             tp = new TopicPartition(record.topic(), partition);
 
@@ -945,6 +955,7 @@ public class KafkaProducer<K, V> implements Producer<K, V> {
             // producer callback will make sure to call both 'callback' and interceptor callback
             Callback interceptCallback = new InterceptorCallback<>(callback, this.interceptors, tp);
 
+            // 将分区信息存储到 transactionManager#newParitionsInTransaction 中
             if (transactionManager != null && transactionManager.isTransactional()) {
                 transactionManager.failIfNotReadyForSend();
             }
@@ -969,8 +980,10 @@ public class KafkaProducer<K, V> implements Producer<K, V> {
             if (transactionManager != null && transactionManager.isTransactional())
                 transactionManager.maybeAddPartitionToTransaction(tp);
 
+            // 如果 batch 已经满了， 则唤醒 sender 线程发送数据
             if (result.batchIsFull || result.newBatchCreated) {
                 log.trace("Waking up the sender since topic {} partition {} is either full or getting a new batch", record.topic(), partition);
+                // 唤醒 Sender 线程
                 this.sender.wakeup();
             }
             return result.future;

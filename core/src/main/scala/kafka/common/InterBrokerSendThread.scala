@@ -101,32 +101,41 @@ abstract class InterBrokerSendThread(name: String,
     pollTimeout
   }
 
+  // 检查连接断开
   private def checkDisconnects(now: Long): Unit = {
     // any disconnects affecting requests that have already been transmitted will be handled
     // by NetworkClient, so we just need to check whether connections for any of the unsent
     // requests have been disconnected; if they have, then we complete the corresponding future
     // and set the disconnect flag in the ClientResponse
+    // 检查连接断开，对于已经传输的请求，将由NetworkClient处理。
+    // 这里只需检查未发送请求中是否有连接断开的情况，
+    // 如果有，就完成相应的future，并在ClientResponse中设置断开标志。
     val iterator = unsentRequests.iterator()
     while (iterator.hasNext) {
       val entry = iterator.next
       val (node, requests) = (entry.getKey, entry.getValue)
+      // 连接失败进行移除
       if (!requests.isEmpty && networkClient.connectionFailed(node)) {
         iterator.remove()
         for (request <- requests.asScala) {
           val authenticationException = networkClient.authenticationException(node)
           if (authenticationException != null)
             error(s"Failed to send the following request due to authentication error: $request")
+          // 请求超时或认证失败，完成相应的 future，并在 ClientResponse 中设置断开标志
           completeWithDisconnect(request, now, authenticationException)
         }
       }
     }
   }
 
+  // 处理超时的请求
   private def failExpiredRequests(now: Long): Unit = {
     // clear all expired unsent requests
+    // 清除所有已超时的未发送请求
     val timedOutRequests = unsentRequests.removeAllTimedOut(now)
     for (request <- timedOutRequests.asScala) {
       debug(s"Failed to send the following request after ${request.requestTimeoutMs} ms: $request")
+      // 请求超时，完成相应的 future，并在 ClientResponse 中设置断开标志
       completeWithDisconnect(request, now, null)
     }
   }

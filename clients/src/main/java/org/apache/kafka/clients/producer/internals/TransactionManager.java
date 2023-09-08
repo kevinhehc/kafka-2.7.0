@@ -101,8 +101,10 @@ public class TransactionManager {
 
     private static class TopicPartitionBookkeeper {
 
+        // 存储每个TopicPartition对应的TopicPartitionEntry
         private final Map<TopicPartition, TopicPartitionEntry> topicPartitions = new HashMap<>();
 
+        // 获取给定TopicPartition对应的TopicPartitionEntry
         private TopicPartitionEntry getPartition(TopicPartition topicPartition) {
             TopicPartitionEntry ent = topicPartitions.get(topicPartition);
             if (ent == null)
@@ -111,18 +113,22 @@ public class TransactionManager {
             return ent;
         }
 
+        // 添加给定的TopicPartition
         private void addPartition(TopicPartition topicPartition) {
             this.topicPartitions.putIfAbsent(topicPartition, new TopicPartitionEntry());
         }
 
+        // 判断TopicPartition对应的TopicPartitionEntry是否存在
         private boolean contains(TopicPartition topicPartition) {
             return topicPartitions.containsKey(topicPartition);
         }
 
+        // 重置TopicPartitionBookkeeper，清空所有的TopicPartitionEntry
         private void reset() {
             topicPartitions.clear();
         }
 
+        // 获取给定TopicPartition的最新确认的偏移量
         private OptionalLong lastAckedOffset(TopicPartition topicPartition) {
             TopicPartitionEntry entry = topicPartitions.get(topicPartition);
             if (entry != null && entry.lastAckedOffset != ProduceResponse.INVALID_OFFSET)
@@ -131,6 +137,7 @@ public class TransactionManager {
                 return OptionalLong.empty();
         }
 
+        // 获取给定TopicPartition的最新确认的序列号
         private OptionalInt lastAckedSequence(TopicPartition topicPartition) {
             TopicPartitionEntry entry = topicPartitions.get(topicPartition);
             if (entry != null && entry.lastAckedSequence != NO_LAST_ACKED_SEQUENCE_NUMBER)
@@ -139,9 +146,11 @@ public class TransactionManager {
                 return OptionalInt.empty();
         }
 
+        // 以给定的ProducerIdAndEpoch为起点，重置TopicPartition对应的序列号、确认的序列号和ProducerIdAndEpoch
         private void startSequencesAtBeginning(TopicPartition topicPartition, ProducerIdAndEpoch newProducerIdAndEpoch) {
             final PrimitiveRef.IntRef sequence = PrimitiveRef.ofInt(0);
             TopicPartitionEntry topicPartitionEntry = getPartition(topicPartition);
+            // 重置序列号
             topicPartitionEntry.resetSequenceNumbers(inFlightBatch -> {
                 inFlightBatch.resetProducerState(newProducerIdAndEpoch, sequence.value, inFlightBatch.isTransactional());
                 sequence.value += inFlightBatch.recordCount;
@@ -154,35 +163,44 @@ public class TransactionManager {
     private static class TopicPartitionEntry {
 
         // The base sequence of the next batch bound for a given partition.
+        // 下一个批次到达给定分区的基本序列号
         private int nextSequence;
 
         // The sequence number of the last record of the last ack'd batch from the given partition. When there are no
         // in flight requests for a partition, the lastAckedSequence(topicPartition) == nextSequence(topicPartition) - 1.
+        // 给定分区的最后一个确认的批次的序列号。当没有待处理的请求时，
         private int lastAckedSequence;
 
         // Keep track of the in flight batches bound for a partition, ordered by sequence. This helps us to ensure that
         // we continue to order batches by the sequence numbers even when the responses come back out of order during
         // leader failover. We add a batch to the queue when it is drained, and remove it when the batch completes
         // (either successfully or through a fatal failure).
+        // 按序列号有序存储给定分区的待处理批次。这有助于在主节点故障切换期间，确保按序列号对批次进行排序。
+        // 当一个批次被发送后，将其添加到队列中，当批次完成时（成功或失败）将其从队列中移除。
         private SortedSet<ProducerBatch> inflightBatchesBySequence;
 
         // We keep track of the last acknowledged offset on a per partition basis in order to disambiguate UnknownProducer
         // responses which are due to the retention period elapsing, and those which are due to actual lost data.
+        // 记录给定分区的最后一个已确认的偏移量，用于区分由于保留期已到期而导致的UnknownProducer响应和由于实际丢失的数据而导致的UnknownProducer响应。
         private long lastAckedOffset;
 
         TopicPartitionEntry() {
             this.nextSequence = 0;
             this.lastAckedSequence = NO_LAST_ACKED_SEQUENCE_NUMBER;
             this.lastAckedOffset = ProduceResponse.INVALID_OFFSET;
+            // 使用基于序列号的Comparator创建按序列号有序的TreeSet
             this.inflightBatchesBySequence = new TreeSet<>(Comparator.comparingInt(ProducerBatch::baseSequence));
         }
 
+        // 重置待处理批次的序列号
         void resetSequenceNumbers(Consumer<ProducerBatch> resetSequence) {
             TreeSet<ProducerBatch> newInflights = new TreeSet<>(Comparator.comparingInt(ProducerBatch::baseSequence));
             for (ProducerBatch inflightBatch : inflightBatchesBySequence) {
+                // 重置批次的序列号
                 resetSequence.accept(inflightBatch);
                 newInflights.add(inflightBatch);
             }
+            // 替换为新的有序批次集合
             inflightBatchesBySequence = newInflights;
         }
     }
@@ -595,19 +613,24 @@ public class TransactionManager {
         if (!isTransactional())
             topicPartitionBookkeeper.addPartition(topicPartition);
 
+        // 获取给定分区的下一个序列号，如果分区不存在则创建之
         return topicPartitionBookkeeper.getPartition(topicPartition).nextSequence;
     }
 
     synchronized void incrementSequenceNumber(TopicPartition topicPartition, int increment) {
+        // 获取当前序列号
         Integer currentSequence = sequenceNumber(topicPartition);
 
+        // 增加指定的序列号
         currentSequence = DefaultRecordBatch.incrementSequence(currentSequence, increment);
+        // 更新给定分区的下一个序列号
         topicPartitionBookkeeper.getPartition(topicPartition).nextSequence = currentSequence;
     }
 
     synchronized void addInFlightBatch(ProducerBatch batch) {
         if (!batch.hasSequence())
             throw new IllegalStateException("Can't track batch for partition " + batch.topicPartition + " when sequence is not set.");
+        // 将批次按其序列号添加到给定分区的待处理批次集合中
         topicPartitionBookkeeper.getPartition(batch.topicPartition).inflightBatchesBySequence.add(batch);
     }
 
@@ -859,24 +882,30 @@ public class TransactionManager {
     }
 
     synchronized TxnRequestHandler nextRequest(boolean hasIncompleteBatches) {
+        // 如果有新的分区需要添加到事务中，则先将添加分区的请求加入请求队列中
         if (!newPartitionsInTransaction.isEmpty())
             enqueueRequest(addPartitionsToTransactionHandler());
 
+        // 获取下一个要处理的请求处理器
         TxnRequestHandler nextRequestHandler = pendingRequests.peek();
         if (nextRequestHandler == null)
             return null;
 
         // Do not send the EndTxn until all batches have been flushed
+        // 如果下一个请求是EndTxn请求，并且存在未完成的批次，则暂时不发送EndTxn请求
         if (nextRequestHandler.isEndTxn() && hasIncompleteBatches)
             return null;
 
+        // 从等待处理的请求队列中移除下一个请求处理器
         pendingRequests.poll();
+        // 如果下一个请求处理器在处理过程中发生了错误，则不发送该请求，返回null
         if (maybeTerminateRequestWithError(nextRequestHandler)) {
             log.trace("Not sending transactional request {} because we are in an error state",
                     nextRequestHandler.requestBuilder());
             return null;
         }
 
+        // 如果下一个请求是EndTxn请求，并且事务没有开始，则完成EndTxn请求并处理事务的完成
         if (nextRequestHandler.isEndTxn() && !transactionStarted) {
             nextRequestHandler.result.done();
             if (currentState != State.FATAL_ERROR) {
@@ -887,6 +916,7 @@ public class TransactionManager {
             nextRequestHandler = pendingRequests.poll();
         }
 
+        // 打印下一个要发送的请求日志
         if (nextRequestHandler != null)
             log.trace("Request {} dequeued for sending", nextRequestHandler.requestBuilder());
 

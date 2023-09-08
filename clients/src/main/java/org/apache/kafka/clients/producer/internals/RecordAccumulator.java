@@ -538,6 +538,8 @@ public final class RecordAccumulator {
         return false;
     }
 
+
+    // 获取目标 Node 的 ProducerBatch 集合
     private List<ProducerBatch> drainBatchesForOneNode(Cluster cluster, Node node, int maxSize, long now) {
         int size = 0;
         List<PartitionInfo> parts = cluster.partitionsForNode(node.id());
@@ -577,6 +579,7 @@ public final class RecordAccumulator {
                     if (shouldStopDrainBatchesForPartition(first, tp))
                         break;
 
+                    // 获取最新的消息批次，并判断是否为事务中的消息。
                     boolean isTransactional = transactionManager != null && transactionManager.isTransactional();
                     ProducerIdAndEpoch producerIdAndEpoch =
                         transactionManager != null ? transactionManager.producerIdAndEpoch() : null;
@@ -590,18 +593,24 @@ public final class RecordAccumulator {
                         // Additionally, we update the next sequence number bound for the partition, and also have
                         // the transaction manager track the batch so as to ensure that sequence ordering is maintained
                         // even if we receive out of order responses.
+                        // 利用 topicPartitionBookkeeper 中的该分区的 nextSequence 给消息批次设置序号，这里也给消息批次设置了事务消息标志 isTransactional，
                         batch.setProducerState(producerIdAndEpoch, transactionManager.sequenceNumber(batch.topicPartition), isTransactional);
+                        // 增加 topicPartitionBookkeeper 中该分区的序号 nextSequence 。
                         transactionManager.incrementSequenceNumber(batch.topicPartition, batch.recordCount);
                         log.debug("Assigned producerId {} and producerEpoch {} to batch with base sequence " +
                                 "{} being sent to partition {}", producerIdAndEpoch.producerId,
                             producerIdAndEpoch.epoch, batch.baseSequence(), tp);
 
+                        // 将批次按其序列号添加到给定分区的待处理批次集合中
                         transactionManager.addInFlightBatch(batch);
                     }
+                    // 关闭底层输出流，将 ProducerBatch 设置成只读状态
                     batch.close();
                     size += batch.records().sizeInBytes();
+                    // 将 ProducerBatch 记录到 ready 集合中
                     ready.add(batch);
 
+                    // 修改 ProducerBatch 的 drainedMs 标记
                     batch.drained(now);
                 }
             }

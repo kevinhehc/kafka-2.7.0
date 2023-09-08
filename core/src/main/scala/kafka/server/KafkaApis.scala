@@ -2391,19 +2391,29 @@ class KafkaApis(val requestChannel: RequestChannel, // 请求通道
       throw new UnsupportedVersionException(s"inter.broker.protocol.version: ${config.interBrokerProtocolVersion.version} is less than the required version: ${version.version}")
   }
 
+  // 处理 AddPartitionToTxnRequest 请求
   def handleAddPartitionToTxnRequest(request: RequestChannel.Request): Unit = {
+    // 确保消息中间件版本兼容KAFKA_0_11_0_IV0版本
     ensureInterBrokerVersion(KAFKA_0_11_0_IV0)
+    // 获取请求中的 AddPartitionsToTxnRequest 对象
     val addPartitionsToTxnRequest = request.body[AddPartitionsToTxnRequest]
+    // 获取事务ID
     val transactionalId = addPartitionsToTxnRequest.data.transactionalId
+    // 获取要添加的分区列表
     val partitionsToAdd = addPartitionsToTxnRequest.partitions.asScala
     if (!authorize(request.context, WRITE, TRANSACTIONAL_ID, transactionalId))
+    // 如果请求的客户端未经授权，则发送错误响应
       sendResponseMaybeThrottle(request, requestThrottleMs =>
         addPartitionsToTxnRequest.getErrorResponse(requestThrottleMs, Errors.TRANSACTIONAL_ID_AUTHORIZATION_FAILED.exception))
     else {
+      // 未授权的主题分区错误映射
       val unauthorizedTopicErrors = mutable.Map[TopicPartition, Errors]()
+      // 不存在的主题分区错误映射
       val nonExistingTopicErrors = mutable.Map[TopicPartition, Errors]()
+      // 授权的分区集合
       val authorizedPartitions = mutable.Set[TopicPartition]()
 
+      // 过滤出授权的主题
       val authorizedTopics = filterByAuthorized(request.context, WRITE, TOPIC,
         partitionsToAdd.filterNot(tp => Topic.isInternal(tp.topic)))(_.topic)
       for (topicPartition <- partitionsToAdd) {
@@ -2419,22 +2429,27 @@ class KafkaApis(val requestChannel: RequestChannel, // 请求通道
         // Any failed partition check causes the entire request to fail. We send the appropriate error codes for the
         // partitions which failed, and an 'OPERATION_NOT_ATTEMPTED' error code for the partitions which succeeded
         // the authorization check to indicate that they were not added to the transaction.
+        // 如果存在未授权的主题分区或不存在的主题分区，则发送相应的错误响应
         val partitionErrors = unauthorizedTopicErrors ++ nonExistingTopicErrors ++
           authorizedPartitions.map(_ -> Errors.OPERATION_NOT_ATTEMPTED)
         sendResponseMaybeThrottle(request, requestThrottleMs =>
           new AddPartitionsToTxnResponse(requestThrottleMs, partitionErrors.asJava))
       } else {
+        // 定义发送回调函数
         def sendResponseCallback(error: Errors): Unit = {
           def createResponse(requestThrottleMs: Int): AbstractResponse = {
             val finalError =
               if (addPartitionsToTxnRequest.version < 2 && error == Errors.PRODUCER_FENCED) {
                 // For older clients, they could not understand the new PRODUCER_FENCED error code,
                 // so we need to return the old INVALID_PRODUCER_EPOCH to have the same client handling logic.
+                // 对于旧版本的客户端，它们无法理解新的PRODUCER_FENCED错误码，
+                // 所以我们需要返回旧INVALID_PRODUCER_EPOCH错误码以保持与客户端处理逻辑一致。
                 Errors.INVALID_PRODUCER_EPOCH
               } else {
                 error
               }
 
+            // 创建响应体对象
             val responseBody: AddPartitionsToTxnResponse = new AddPartitionsToTxnResponse(requestThrottleMs,
               partitionsToAdd.map{tp => (tp, finalError)}.toMap.asJava)
             trace(s"Completed $transactionalId's AddPartitionsToTxnRequest with partitions $partitionsToAdd: errors: $error from client ${request.header.clientId}")
@@ -2442,9 +2457,11 @@ class KafkaApis(val requestChannel: RequestChannel, // 请求通道
           }
 
 
+          // 发送响应
           sendResponseMaybeThrottle(request, createResponse)
         }
 
+        // 处理添加分区到事务的逻辑操作
         txnCoordinator.handleAddPartitionsToTransaction(transactionalId,
           addPartitionsToTxnRequest.data.producerId,
           addPartitionsToTxnRequest.data.producerEpoch,
@@ -2455,12 +2472,17 @@ class KafkaApis(val requestChannel: RequestChannel, // 请求通道
   }
 
   def handleAddOffsetsToTxnRequest(request: RequestChannel.Request): Unit = {
+    // 确保 broker 版本达到 KAFKA_0_11_0_IV0，否则抛出异常
     ensureInterBrokerVersion(KAFKA_0_11_0_IV0)
+    // 从请求体中提取出 AddOffsetsToTxnRequest
     val addOffsetsToTxnRequest = request.body[AddOffsetsToTxnRequest]
+    // 获取 transactionalId 和 groupId
     val transactionalId = addOffsetsToTxnRequest.data.transactionalId
     val groupId = addOffsetsToTxnRequest.data.groupId
+    // 根据 groupId 获取 TopicPartition
     val offsetTopicPartition = new TopicPartition(GROUP_METADATA_TOPIC_NAME, groupCoordinator.partitionFor(groupId))
 
+    // 检查是否有对 transactionalId 进行 WRITE 权限
     if (!authorize(request.context, WRITE, TRANSACTIONAL_ID, transactionalId))
       sendResponseMaybeThrottle(request, requestThrottleMs =>
         new AddOffsetsToTxnResponse(new AddOffsetsToTxnResponseData()
@@ -2473,12 +2495,16 @@ class KafkaApis(val requestChannel: RequestChannel, // 请求通道
           .setThrottleTimeMs(requestThrottleMs))
       )
     else {
+      // 如果权限验证通过
       def sendResponseCallback(error: Errors): Unit = {
         def createResponse(requestThrottleMs: Int): AbstractResponse = {
           val finalError =
             if (addOffsetsToTxnRequest.version < 2 && error == Errors.PRODUCER_FENCED) {
               // For older clients, they could not understand the new PRODUCER_FENCED error code,
               // so we need to return the old INVALID_PRODUCER_EPOCH to have the same client handling logic.
+              // 对于较旧的客户端，它们无法理解新的PRODUCER_FENCED错误码，
+              // 因此我们需要返回INVALID_PRODUCER_EPOCH以保持相同的客户端处理逻辑。
+
               Errors.INVALID_PRODUCER_EPOCH
             } else {
               error
@@ -2495,6 +2521,7 @@ class KafkaApis(val requestChannel: RequestChannel, // 请求通道
         sendResponseMaybeThrottle(request, createResponse)
       }
 
+      // 处理结束事务请求
       txnCoordinator.handleAddPartitionsToTransaction(transactionalId,
         addOffsetsToTxnRequest.data.producerId,
         addOffsetsToTxnRequest.data.producerEpoch,
