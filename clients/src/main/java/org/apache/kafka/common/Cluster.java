@@ -35,16 +35,27 @@ import java.util.Set;
 public final class Cluster {
 
     private final boolean isBootstrapConfigured;
+    // kafka集群中的broker节点集合，代表kafka的服务器的信息。
     private final List<Node> nodes;
+    // 未授权的主题集合
     private final Set<String> unauthorizedTopics;
+    // 无效的主题集合
     private final Set<String> invalidTopics;
+    // 内部主题集合
     private final Set<String> internalTopics;
+    // controller 节点
     private final Node controller;
+    // topic对应的 partition 信息字典,存放的 partition 不一定有 Leader 副本, 键为topic,值为 partition 信息集合。
     private final Map<TopicPartition, PartitionInfo> partitionsByTopicPartition;
+    // 键为topic,值为可用 partition 信息集合,存放的 partition 一定有 Leader 副本
     private final Map<String, List<PartitionInfo>> partitionsByTopic;
+    // topic中可用的partition信息字典，键为topic名称,值为可用 partition 信息集合，存放的partition必须是有Leader副本的Partition
     private final Map<String, List<PartitionInfo>> availablePartitionsByTopic;
+    // broker对应的partition信息字典，键为broker的id，值为partition信息集合
     private final Map<Integer, List<PartitionInfo>> partitionsByNode;
+    // broker对应的Node信息字典，键为broker的id，值为表示该节点的Node实例
     private final Map<Integer, Node> nodesById;
+    // kafka集群的id信息
     private final ClusterResource clusterResource;
 
     /**

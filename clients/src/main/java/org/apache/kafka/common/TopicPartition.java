@@ -25,10 +25,14 @@ import java.util.Objects;
 public final class TopicPartition implements Serializable {
     private static final long serialVersionUID = -613627415771699627L;
 
+    // hash值，用来hashCode方法缓存
     private int hash = 0;
+    // 分区编号
     private final int partition;
+    // 主题名称
     private final String topic;
 
+    // 初始化主题分区索引
     public TopicPartition(String topic, int partition) {
         this.partition = partition;
         this.topic = topic;
@@ -42,6 +46,7 @@ public final class TopicPartition implements Serializable {
         return topic;
     }
 
+    // 计算hash值
     @Override
     public int hashCode() {
         if (hash != 0)

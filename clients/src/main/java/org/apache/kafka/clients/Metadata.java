@@ -131,6 +131,7 @@ public class Metadata implements Closeable {
      * @param nowMs current time in ms
      * @return remaining time in ms till the cluster info can be updated again
      */
+    // 计算允许更新元数据的时机
     public synchronized long timeToAllowUpdate(long nowMs) {
         return Math.max(this.lastRefreshMs + this.refreshBackoffMs - nowMs, 0);
     }
@@ -143,6 +144,7 @@ public class Metadata implements Closeable {
      * @param nowMs current time in ms
      * @return remaining time in ms till updating the cluster info
      */
+    // 计算下次更新元数据的时间
     public synchronized long timeToNextUpdate(long nowMs) {
         long timeToExpire = updateRequested() ? 0 : Math.max(this.lastSuccessfulRefreshMs + this.metadataExpireMs - nowMs, 0);
         return Math.max(timeToExpire, timeToAllowUpdate(nowMs));
@@ -217,6 +219,7 @@ public class Metadata implements Closeable {
      *
      * @return true if an update was requested, false otherwise
      */
+    // 判断这2个标识是否为true
     public synchronized boolean updateRequested() {
         return this.needFullUpdate || this.needPartialUpdate;
     }

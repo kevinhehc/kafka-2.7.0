@@ -27,8 +27,11 @@ import java.nio.channels.GatheringByteChannel;
 public class ByteBufferSend implements Send {
 
     private final String destination;
+    // 总共要写多少字节数据
     private final int size;
+    // 用于写入channel里的ByteBuffer数组，说明kafka一次最大传输字节是有限定的
     protected final ByteBuffer[] buffers;
+    // 总共还剩多少字节没有写完
     private int remaining;
     private boolean pending = false;
 
@@ -37,16 +40,19 @@ public class ByteBufferSend implements Send {
         this.buffers = buffers;
         for (ByteBuffer buffer : buffers)
             remaining += buffer.remaining();
+        // 计算需要写入字节的总和
         this.size = remaining;
     }
 
     @Override
     public String destination() {
+        // 返回对应的channel id
         return destination;
     }
 
     @Override
     public boolean completed() {
+        // 判断是否完成 即没有剩余&pending=false
         return remaining <= 0 && !pending;
     }
 
@@ -55,12 +61,16 @@ public class ByteBufferSend implements Send {
         return this.size;
     }
 
+    // 将字节流数据写入到channel中
     @Override
     public long writeTo(GatheringByteChannel channel) throws IOException {
+        // 1.调用nio底层write方法把buffers写入传输层返回写入的字节数
         long written = channel.write(buffers);
         if (written < 0)
             throw new EOFException("Wrote negative bytes to channel. This shouldn't happen.");
+        // 2.计算还剩多少字节没有写入传输层
         remaining -= written;
+        // 每次发送 都检查是否
         pending = TransportLayers.hasPendingWrites(channel);
         return written;
     }

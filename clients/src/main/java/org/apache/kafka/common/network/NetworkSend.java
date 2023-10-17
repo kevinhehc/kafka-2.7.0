@@ -23,14 +23,21 @@ import java.nio.ByteBuffer;
  */
 public class NetworkSend extends ByteBufferSend {
 
+    // 实例化
     public NetworkSend(String destination, ByteBuffer buffer) {
+        // 调用父类的方法初始化
         super(destination, sizeBuffer(buffer.remaining()), buffer);
     }
 
+    // 用来构造4个字节的 sizeBuffer
     private static ByteBuffer sizeBuffer(int size) {
+        // 先分配一个4个字节的ByteBuffer
         ByteBuffer sizeBuffer = ByteBuffer.allocate(4);
+        // 写入size长度值
         sizeBuffer.putInt(size);
+        // 重置 position
         sizeBuffer.rewind();
+        // 返回 sizeBuffer
         return sizeBuffer;
     }
 

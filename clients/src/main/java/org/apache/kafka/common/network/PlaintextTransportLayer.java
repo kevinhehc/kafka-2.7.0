@@ -31,12 +31,18 @@ import java.security.Principal;
 import org.apache.kafka.common.security.auth.KafkaPrincipal;
 
 public class PlaintextTransportLayer implements TransportLayer {
+    // java nio 中 SelectionKey 事件
     private final SelectionKey key;
+    // java nio 中的SocketChannel
     private final SocketChannel socketChannel;
+    // 安全相关
     private final Principal principal = KafkaPrincipal.ANONYMOUS;
 
+    // 初始化
     public PlaintextTransportLayer(SelectionKey key) throws IOException {
+        // 对 NIO 中 SelectionKey 类的对象引用
         this.key = key;
+        // 对 NIO 中 SocketChannel 类的对象引用
         this.socketChannel = (SocketChannel) key.channel();
     }
 
@@ -45,11 +51,16 @@ public class PlaintextTransportLayer implements TransportLayer {
         return true;
     }
 
+    // 判断网络连接是否完成
     @Override
     public boolean finishConnect() throws IOException {
+        // 1. 调用socketChannel的finishConnect方法，返回该连接是否已经连接完成
         boolean connected = socketChannel.finishConnect();
+        // 2. 如果网络连接完成以后就删除对OP_CONNECT事件的监听，同时添加对OP_READ事件的监听
         if (connected)
+            // 事件操作
             key.interestOps(key.interestOps() & ~SelectionKey.OP_CONNECT | SelectionKey.OP_READ);
+        // 3. 最后返回网络连接
         return connected;
     }
 
@@ -100,6 +111,7 @@ public class PlaintextTransportLayer implements TransportLayer {
     */
     @Override
     public int read(ByteBuffer dst) throws IOException {
+        // 调用 NIO 的通道实现数据的读取
         return socketChannel.read(dst);
     }
 
@@ -188,6 +200,7 @@ public class PlaintextTransportLayer implements TransportLayer {
      */
     @Override
     public void addInterestOps(int ops) {
+        //通过 key.interestOps() | ops 来添加事件
         key.interestOps(key.interestOps() | ops);
 
     }

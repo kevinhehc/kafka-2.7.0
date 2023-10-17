@@ -927,10 +927,12 @@ public class KafkaProducer<K, V> implements Producer<K, V> {
      * @throws SerializationException If the key or value are not valid objects given the configured serializers
      * @throws KafkaException If a Kafka related error occurs that does not belong to the public API exceptions.
      */
+    // 向 topic 异步地发送数据，当发送确认后唤起回调函数
     @Override
     public Future<RecordMetadata> send(ProducerRecord<K, V> record, Callback callback) {
         // intercept the record, which can be potentially modified; this method does not throw exceptions
         ProducerRecord<K, V> interceptedRecord = this.interceptors.onSend(record);
+        // 调用 doSend 发送，支持回调函数
         return doSend(interceptedRecord, callback);
     }
 
@@ -947,8 +949,10 @@ public class KafkaProducer<K, V> implements Producer<K, V> {
     private Future<RecordMetadata> doSend(ProducerRecord<K, V> record, Callback callback) {
         TopicPartition tp = null;
         try {
+            // 假如 sender 线程为空或者不运行，报错
             throwIfProducerClosed();
             // first make sure the metadata for the topic is available
+            // 当前时间【毫秒】
             long nowMs = time.milliseconds();
             ClusterAndWaitTime clusterAndWaitTime;
             try {
@@ -1075,17 +1079,23 @@ public class KafkaProducer<K, V> implements Producer<K, V> {
      */
     private ClusterAndWaitTime waitOnMetadata(String topic, Integer partition, long nowMs, long maxWaitMs) throws InterruptedException {
         // add topic to metadata topic list if it is not there already and reset expiry
+        // 1. 从元数据缓存中获取元数据
         Cluster cluster = metadata.fetch();
 
+        // 2. 判断该主题是否是无效的主题
         if (cluster.invalidTopics().contains(topic))
             throw new InvalidTopicException(topic);
 
+        // 3. 将该主题放入元数据主题列表中
         metadata.add(topic, nowMs);
 
+        // 4. 从元数据缓存中获取主题对应的分区数
         Integer partitionsCount = cluster.partitionCountForTopic(topic);
         // Return cached metadata if we have it, and if the record's partition is either undefined
         // or within the known partition range
+        // 5. 满足这些条件后就不用拉取元数据，直接从元数据缓存中返回
         if (partitionsCount != null && (partition == null || partition < partitionsCount))
+            // 返回元数据信息
             return new ClusterAndWaitTime(cluster, 0);
 
         long remainingWaitMs = maxWaitMs;
@@ -1093,16 +1103,21 @@ public class KafkaProducer<K, V> implements Producer<K, V> {
         // Issue metadata requests until we have metadata for the topic and the requested partition,
         // or until maxWaitTimeMs is exceeded. This is necessary in case the metadata
         // is stale and the number of partitions for this topic has increased in the meantime.
+        // 6. 不停的轮询唤醒 sender 线程更新元数据
         do {
             if (partition != null) {
                 log.trace("Requesting metadata update for partition {} of topic {}.", partition, topic);
             } else {
                 log.trace("Requesting metadata update for topic {}.", topic);
             }
+            // 7. 将主题 topic及过期时间添加到元数据主题列表中
             metadata.add(topic, nowMs + elapsed);
+            // 8. 标记元数据更新标识，获取元数据版本号
             int version = metadata.requestUpdateForTopic(topic);
+            // 9. 唤醒 sender 子线程
             sender.wakeup();
             try {
+                // 10. 阻塞线程等待元数据更新成功
                 metadata.awaitUpdate(version, remainingWaitMs);
             } catch (TimeoutException ex) {
                 // Rethrow with original maxWaitMs to prevent logging exception with remainingWaitMs
@@ -1110,8 +1125,11 @@ public class KafkaProducer<K, V> implements Producer<K, V> {
                         String.format("Topic %s not present in metadata after %d ms.",
                                 topic, maxWaitMs));
             }
+            // 11. 到这里，应该是当前cluster更新成功了，再次获取元数据
             cluster = metadata.fetch();
+            // 12. 计算等待更新完成元数据消耗时间
             elapsed = time.milliseconds() - nowMs;
+            // 13. 如果超时，抛超时异常
             if (elapsed >= maxWaitMs) {
                 throw new TimeoutException(partitionsCount == null ?
                         String.format("Topic %s not present in metadata after %d ms.",
@@ -1121,9 +1139,11 @@ public class KafkaProducer<K, V> implements Producer<K, V> {
             }
             metadata.maybeThrowExceptionForTopic(topic);
             remainingWaitMs = maxWaitMs - elapsed;
+            // 14. 获取元数据分区数
             partitionsCount = cluster.partitionCountForTopic(topic);
         } while (partitionsCount == null || (partition != null && partition >= partitionsCount));
 
+        // 15. 返回元数据以及消耗时间
         return new ClusterAndWaitTime(cluster, elapsed);
     }
 
