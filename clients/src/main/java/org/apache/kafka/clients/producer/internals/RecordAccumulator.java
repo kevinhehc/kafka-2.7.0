@@ -69,19 +69,29 @@ public final class RecordAccumulator {
     private volatile boolean closed;
     private final AtomicInteger flushesInProgress;
     private final AtomicInteger appendsInProgress;
+    // 消息批次大小，默认16KB；
     private final int batchSize;
+    // 消息压缩方式，主要包括none、gzip、snappy、lz4、zstd。
+    // 默认是不进行压缩，如果你的 Topic 占用的磁盘空间比较多的话，可以考虑启用压缩，以节省资源。
     private final CompressionType compression;
+    // 消息 batch 延迟多久再发送的时间，这是吞吐量与延时之间的权衡。
+    // 为了不频繁发送网络请求，设置延迟时间后 batch 会尽量积累更多的消息再发送出去。
     private final int lingerMs;
+    // 设置失败重试的退避时间。
     private final long retryBackoffMs;
+    // 设置消息投递超时时间。
     private final int deliveryTimeoutMs;
+    // 缓存池
     private final BufferPool free;
     private final Time time;
+    // 客户端api版本。
     private final ApiVersions apiVersions;
     private final ConcurrentMap<TopicPartition, Deque<ProducerBatch>> batches;
     private final IncompleteBatches incomplete;
     // The following variables are only accessed by the sender thread, so we don't need to protect them.
     private final Set<TopicPartition> muted;
     private int drainIndex;
+    // 事务管理器。
     private final TransactionManager transactionManager;
     private long nextBatchExpiryTimeMs = Long.MAX_VALUE; // the earliest time (absolute) a batch will expire.
 

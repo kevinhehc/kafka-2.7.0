@@ -24,7 +24,7 @@ import java.io.Closeable;
 /**
  * Partitioner Interface
  */
-
+// 核心是根据 record 来计算所在的 partition
 public interface Partitioner extends Configurable, Closeable {
 
     /**
