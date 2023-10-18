@@ -34,9 +34,12 @@ import java.nio.ByteBuffer;
  */
 public class ByteBufferOutputStream extends OutputStream {
 
+    // 扩容因子1.1倍
     private static final float REALLOCATION_FACTOR = 1.1f;
 
+    // 初始容量
     private final int initialCapacity;
+    // 初始位置
     private final int initialPosition;
     private ByteBuffer buffer;
 
@@ -112,21 +115,32 @@ public class ByteBufferOutputStream extends OutputStream {
      *
      * @param remainingBytesRequired The number of bytes required
      */
+    // 计算是否需要扩容
     public void ensureRemaining(int remainingBytesRequired) {
+        // 当写入字节数大于buffer当前剩余字节数就开启扩容
         if (remainingBytesRequired > buffer.remaining())
             expandBuffer(remainingBytesRequired);
     }
 
+    // 扩容
     private void expandBuffer(int remainingRequired) {
+        // 1. 评估需要多少空间
         int expandSize = Math.max((int) (buffer.limit() * REALLOCATION_FACTOR), buffer.position() + remainingRequired);
+        // 2. 申请新的ByteBuffer
         ByteBuffer temp = ByteBuffer.allocate(expandSize);
+        // 3. 获取写入上限
         int limit = limit();
+        // 4. 写状态转换为读状态
         buffer.flip();
+        // 5. 将buffer读到新申请的temp里
         temp.put(buffer);
+        // 6. 修改写模式的limit上限
         buffer.limit(limit);
         // reset the old buffer's position so that the partial data in the new buffer cannot be mistakenly consumed
         // we should ideally only do this for the original buffer, but the additional complexity doesn't seem worth it
+        // 7. 更新原来的buffer的position，防止被重复消费
         buffer.position(initialPosition);
+        // 8. 将引用指向新申请的ByteBuffer
         buffer = temp;
     }
 

@@ -356,6 +356,7 @@ public class KafkaChannel implements AutoCloseable {
         return transportLayer.ready();
     }
 
+    // channel 连接就绪
     public boolean ready() {
         return transportLayer.ready() && authenticator.complete();
     }

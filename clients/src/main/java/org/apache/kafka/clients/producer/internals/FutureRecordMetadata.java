@@ -73,11 +73,13 @@ public final class FutureRecordMetadata implements Future<RecordMetadata> {
         long now = time.milliseconds();
         long timeoutMillis = unit.toMillis(timeout);
         long deadline = Long.MAX_VALUE - timeoutMillis < now ? Long.MAX_VALUE : now + timeoutMillis;
+        // 依赖ProduceRequestResult的CountDown来实现阻塞等待
         boolean occurred = this.result.await(timeout, unit);
         if (!occurred)
             throw new TimeoutException("Timeout after waiting for " + timeoutMillis + " ms.");
         if (nextRecordMetadata != null)
             return nextRecordMetadata.get(deadline - time.milliseconds(), TimeUnit.MILLISECONDS);
+        // 调用value()方法返回RecordMetadata对象
         return valueOrError();
     }
 
@@ -107,6 +109,8 @@ public final class FutureRecordMetadata implements Future<RecordMetadata> {
     RecordMetadata value() {
         if (nextRecordMetadata != null)
             return nextRecordMetadata.value();
+        // 将 partition、baseOffset、relativeOffset、时间戳（LogAppendTime | CreateTimeStamp）
+        // 等信息封装成 RecordMetadata 对象返回
         return new RecordMetadata(result.topicPartition(), this.result.baseOffset(), this.relativeOffset,
                                   timestamp(), this.checksum, this.serializedKeySize, this.serializedValueSize);
     }

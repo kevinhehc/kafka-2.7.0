@@ -383,20 +383,29 @@ public class Selector implements Selectable, AutoCloseable {
      * Queue the given request for sending in the subsequent {@link #poll(long)} calls
      * @param send The request to send
      */
+    // 消息预发送
     public void send(Send send) {
+        // 1. 从服务端获取 connectionId
         String connectionId = send.destination();
+        // 2. 从数据包中获取对应连接
         KafkaChannel channel = openOrClosingChannelOrFail(connectionId);
+        // 3. 如果关闭连接集合中存在该连接
         if (closingChannels.containsKey(connectionId)) {
             // ensure notification via `disconnected`, leave channel in the state in which closing was triggered
+            // 把 connectionId 放入 failedSends 集合里
             this.failedSends.add(connectionId);
         } else {
             try {
+                // 4. 暂存数据预发送，并没有真正的发送,一次只能发送一个
                 channel.setSend(send);
             } catch (Exception e) {
                 // update the state for consistency, the channel will be discarded after `close`
+                // 5. 更新 KafkaChannel 的状态为发送失败
                 channel.state(ChannelState.FAILED_SEND);
                 // ensure notification via `disconnected` when `failedSends` are processed in the next poll
+                // 6. 把 connectionId 放入 failedSends 集合里
                 this.failedSends.add(connectionId);
+                // 7. 关闭连接
                 close(channel, CloseMode.DISCARD_NO_NOTIFY);
                 if (!(e instanceof CancelledKeyException)) {
                     log.error("Unexpected exception during send, closing connection {} and rethrowing exception {}",
@@ -462,26 +471,32 @@ public class Selector implements Selectable, AutoCloseable {
 
         /* check ready keys */
         long startSelect = time.nanoseconds();
+        // 调用nioSelector.select线程阻塞等待I/O事件并设置阻塞时间，等待I/O事件就绪发生，然后返回已经监控到了多少准备就绪的事件
         int numReadyKeys = select(timeout);
         long endSelect = time.nanoseconds();
         this.sensors.selectTime.record(endSelect - startSelect, time.milliseconds());
 
+        // 监听到事件发生或立即连接集合不为空或存在缓存数据
         if (numReadyKeys > 0 || !immediatelyConnectedKeys.isEmpty() || dataInBuffers) {
             Set<SelectionKey> readyKeys = this.nioSelector.selectedKeys();
 
             // Poll from channels that have buffered data (but nothing more from the underlying socket)
+            // 在SSL连接才可能会存在缓存数据
             if (dataInBuffers) {
                 keysWithBufferedRead.removeAll(readyKeys); //so no channel gets polled twice
                 Set<SelectionKey> toPoll = keysWithBufferedRead;
                 keysWithBufferedRead = new HashSet<>(); //poll() calls will repopulate if needed
+                // 处理事件
                 pollSelectionKeys(toPoll, false, endSelect);
             }
 
             // Poll from channels where the underlying socket has more data
+            // 处理监听到的准备就绪事件
             pollSelectionKeys(readyKeys, false, endSelect);
             // Clear all selected keys so that they are included in the ready count for the next select
             readyKeys.clear();
 
+            // 处理立即连接集合
             pollSelectionKeys(immediatelyConnectedKeys, true, endSelect);
             immediatelyConnectedKeys.clear();
         } else {
@@ -509,10 +524,13 @@ public class Selector implements Selectable, AutoCloseable {
     void pollSelectionKeys(Set<SelectionKey> selectionKeys,
                            boolean isImmediatelyConnected,
                            long currentTimeNanos) {
+        //1. 循环调用当前监听到的事件(原顺序或者洗牌后顺序)
         for (SelectionKey key : determineHandlingOrder(selectionKeys)) {
+            // 2. 之前创建连接，把kafkachanel注册到key上，这里就是获取对应的 channel
             KafkaChannel channel = channel(key);
             long channelStartTimeNanos = recordTimePerConnection ? time.nanoseconds() : 0;
             boolean sendFailed = false;
+            // 3. 获取节点id
             String nodeId = channel.id();
 
             // register all per-connection metrics at once
@@ -571,8 +589,10 @@ public class Selector implements Selectable, AutoCloseable {
 
                 //if channel is ready and has bytes to read from socket or buffer, and has no
                 //previous completed receive then read from it
+                // 4. 读事件是否准备就绪了
                 if (channel.ready() && (key.isReadable() || channel.hasBytesBuffered()) && !hasCompletedReceive(channel)
                         && !explicitlyMutedChannels.contains(channel)) {
+                    // 尝试处理读事件
                     attemptRead(channel);
                 }
 
@@ -590,6 +610,7 @@ public class Selector implements Selectable, AutoCloseable {
 
                 long nowNanos = channelStartTimeNanos != 0 ? channelStartTimeNanos : currentTimeNanos;
                 try {
+                    // 5. 尝试处理写事件
                     attemptWrite(key, channel, nowNanos);
                 } catch (Exception e) {
                     sendFailed = true;
@@ -630,10 +651,12 @@ public class Selector implements Selectable, AutoCloseable {
     }
 
     private void attemptWrite(SelectionKey key, KafkaChannel channel, long nowNanos) throws IOException {
+        // 此处需要满足4个条件才可以进行写操作
         if (channel.hasSend()
                 && channel.ready()
                 && key.isWritable()
                 && !channel.maybeBeginClientReauthentication(() -> nowNanos)) {
+            // 进行写操作
             write(channel);
         }
     }

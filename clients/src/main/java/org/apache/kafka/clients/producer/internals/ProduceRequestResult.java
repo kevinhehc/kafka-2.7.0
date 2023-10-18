@@ -31,9 +31,12 @@ import java.util.concurrent.TimeUnit;
  */
 public class ProduceRequestResult {
 
+    // 通过一个count为1的CountDownLatch对象间接地实现了Future的功能。
     private final CountDownLatch latch = new CountDownLatch(1);
     private final TopicPartition topicPartition;
 
+    // 用来记录broker端关联ProducerBatch中第一条Record分配的offset值
+    // 这样每个Record的真实offset就可以根据自身在ProducerBatch的位置计算出来了(baseOffset + relativeOffset)
     private volatile Long baseOffset = null;
     private volatile long logAppendTime = RecordBatch.NO_TIMESTAMP;
     private volatile RuntimeException error;
@@ -43,6 +46,7 @@ public class ProduceRequestResult {
      *
      * @param topicPartition The topic and partition to which this record set was sent was sent
      */
+    // 构造函数
     public ProduceRequestResult(TopicPartition topicPartition) {
         this.topicPartition = topicPartition;
     }
@@ -63,6 +67,7 @@ public class ProduceRequestResult {
     /**
      * Mark this request as complete and unblock any threads waiting on its completion.
      */
+    // 当等到响应会会调该函数唤醒阻塞的主线程
     public void done() {
         if (baseOffset == null)
             throw new IllegalStateException("The method `set` must be invoked before this method.");
@@ -72,6 +77,7 @@ public class ProduceRequestResult {
     /**
      * Await the completion of this request
      */
+    // 调用await()方法的线程会被挂起，它会等待直到count值为0才继续执行
     public void await() throws InterruptedException {
         latch.await();
     }
@@ -82,6 +88,7 @@ public class ProduceRequestResult {
      * @param unit The unit for the max time
      * @return true if the request completed, false if we timed out
      */
+    // 和await()类似，只不过等待一定的时间后count值还没变为0的话就会继续执行
     public boolean await(long timeout, TimeUnit unit) throws InterruptedException {
         return latch.await(timeout, unit);
     }

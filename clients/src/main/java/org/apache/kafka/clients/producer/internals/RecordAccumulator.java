@@ -86,6 +86,7 @@ public final class RecordAccumulator {
     private final Time time;
     // 客户端api版本。
     private final ApiVersions apiVersions;
+    // partition对应的的 Deque
     private final ConcurrentMap<TopicPartition, Deque<ProducerBatch>> batches;
     private final IncompleteBatches incomplete;
     // The following variables are only accessed by the sender thread, so we don't need to protect them.
@@ -187,70 +188,94 @@ public final class RecordAccumulator {
      *                        running the partitioner's onNewBatch method before trying to append again
      * @param nowMs The current time, in milliseconds
      */
-    public RecordAppendResult append(TopicPartition tp,
-                                     long timestamp,
-                                     byte[] key,
-                                     byte[] value,
-                                     Header[] headers,
-                                     Callback callback,
+    public RecordAppendResult append(TopicPartition tp,  // 要发送的 Topic 分区
+                                     long timestamp,  // 发送时的时间戳
+                                     byte[] key,  // 消息的key
+                                     byte[] value,  // 消息的value
+                                     Header[] headers,   // 消息头
+                                     Callback callback,  // 回调方法
                                      long maxTimeToBlock,
-                                     boolean abortOnNewBatch,
-                                     long nowMs) throws InterruptedException {
+                                     boolean abortOnNewBatch,  // 终止新的消息批次
+                                     long nowMs  // 当前发送时间
+    ) throws InterruptedException {
         // We keep track of the number of appending thread to make sure we do not miss batches in
         // abortIncompleteBatches().
+        // 统计正在向 RecordAccumulator 中写入的 Record 数量
         appendsInProgress.incrementAndGet();
         ByteBuffer buffer = null;
         if (headers == null) headers = Record.EMPTY_HEADERS;
         try {
             // check if we have an in-progress batch
+            // 从 batches 集合中查找目标分区对应的 ArrayDeque<ProducerBatch> 集合，
+            // 如果查找失败，则创建新的 ArrayDeque<ProducerBatch>，并添加到 batches 集合中。
             Deque<ProducerBatch> dq = getOrCreateDeque(tp);
+            // 第一次对 ArrayDeque<ProducerBatch> 加锁，相同的 dq 都会竞争这个锁
             synchronized (dq) {
+                // 判断生产者是否已经关闭了
                 if (closed)
                     throw new KafkaException("Producer closed while send in progress");
+                // 尝试往 batches 里面追加消息
                 RecordAppendResult appendResult = tryAppend(timestamp, key, value, headers, callback, dq, nowMs);
+                // 如果 Deque<ProducerBatch> 最后一个 ProducerBatch 空间够用, 一般都会追加成功，返回 RecordAppendResult
                 if (appendResult != null)
                     return appendResult;
             }
 
             // we don't have an in-progress record batch try to allocate a new batch
+            // 如果追加 Record 失败，可能因为当前使用的 ProducerBatch 已经被填满了，
+            // 会根据abortOnNewBatch 参数决定是否立即返回 RecordAppendResult 结果，
+            // 返回的 RecordAppendResult 中如果abortForNewBatch 为 true，会再触发一次 append()方法
             if (abortOnNewBatch) {
                 // Return a result that will cause another call to append.
                 return new RecordAppendResult(null, false, false, true);
             }
 
             byte maxUsableMagic = apiVersions.maxUsableProduceMagic();
+            // 预估size大小，重新分配ProducerBatch
             int size = Math.max(this.batchSize, AbstractRecords.estimateSizeInBytesUpperBound(maxUsableMagic, compression, key, value, headers));
             log.trace("Allocating a new {} byte message buffer for topic {} partition {} with remaining timeout {}ms", size, tp.topic(), tp.partition(), maxTimeToBlock);
+            // 从 BufferPool 中分配 ByteBuffer
             buffer = free.allocate(size, maxTimeToBlock);
 
             // Update the current time in case the buffer allocation blocked above.
             nowMs = time.milliseconds();
+            // 再次对 ArrayDeque<ProducerBatch> 加锁
             synchronized (dq) {
                 // Need to check if producer is closed again after grabbing the dequeue lock.
                 if (closed)
                     throw new KafkaException("Producer closed while send in progress");
 
+                // 再次尝试 tryAppend() 方法追加消息
                 RecordAppendResult appendResult = tryAppend(timestamp, key, value, headers, callback, dq, nowMs);
                 if (appendResult != null) {
                     // Somebody else found us a batch, return the one we waited for! Hopefully this doesn't happen often...
                     return appendResult;
                 }
 
+                // 将 ByteBuffer 封装成 MemoryRecordsBuilder
                 MemoryRecordsBuilder recordsBuilder = recordsBuilder(buffer, maxUsableMagic);
+                // 使用 BufferPool 新申请的 ByteBuffer 构建 ProducerBatch 对象
                 ProducerBatch batch = new ProducerBatch(tp, recordsBuilder, nowMs);
+                // 通过 tryAppend() 方法将 Record 追加到 ProducerBatch 中
                 FutureRecordMetadata future = Objects.requireNonNull(batch.tryAppend(timestamp, key, value, headers,
                         callback, nowMs));
 
+                // 将 ProducerBatch 追加到 ArrayDeque<ProducerBatch> 尾部
                 dq.addLast(batch);
+                // 将 ProducerBatch 添加到 IncompleteBatches 中, 待发送完后会从该集合删除。
                 incomplete.add(batch);
 
                 // Don't deallocate this buffer in the finally block as it's being used in the record batch
+                // 清空 buffer
                 buffer = null;
                 return new RecordAppendResult(future, dq.size() > 1 || batch.isFull(), true, false);
             }
         } finally {
+            // 如果 buffer 不为空，则表示写入过程中出现异常，这里会释放 ByteBuffer
             if (buffer != null)
+                // 释放空间
                 free.deallocate(buffer);
+            // 表示当前 Record 已经写入完成，递减 appendsInProgress
             appendsInProgress.decrementAndGet();
         }
     }
@@ -271,19 +296,25 @@ public final class RecordAccumulator {
      *  and memory records built) in one of the following cases (whichever comes first): right before send,
      *  if it is expired, or when the producer is closed.
      */
+    // 尝试追加消息
     private RecordAppendResult tryAppend(long timestamp, byte[] key, byte[] value, Header[] headers,
                                          Callback callback, Deque<ProducerBatch> deque, long nowMs) {
+        // 获取 ArrayDeque<ProducerBatch> 集合中最后一个 ProducerBatch 对象
         ProducerBatch last = deque.peekLast();
         if (last != null) {
+            // 尝试将消息写入 last 这个 ProducerBatch 对象
             FutureRecordMetadata future = last.tryAppend(timestamp, key, value, headers, callback, nowMs);
             if (future == null)
+                // 写入失败，则关闭 last 指向的 ProducerBatch 对象，同时返回 null 表示写入失败
                 last.closeForRecordAppends();
             else
+                // 写入成功，则返回 RecordAppendResult 对象
                 return new RecordAppendResult(future, deque.size() > 1 || last.isFull(), false, false);
         }
         return null;
     }
 
+    // 判断 muted 集合中是否存在该主题分区
     private boolean isMuted(TopicPartition tp) {
         return muted.contains(tp);
     }
@@ -308,17 +339,27 @@ public final class RecordAccumulator {
      */
     public List<ProducerBatch> expiredBatches(long now) {
         List<ProducerBatch> expiredBatches = new ArrayList<>();
+        //1. 获取每个分区对应的批次队列
         for (Map.Entry<TopicPartition, Deque<ProducerBatch>> entry : this.batches.entrySet()) {
             // expire the batches in the order of sending
             Deque<ProducerBatch> deque = entry.getValue();
             synchronized (deque) {
+                //2. 如果队列中存在批次对象
                 while (!deque.isEmpty()) {
+                    // 3. 获取队列中头部的批次对象
+                    // 为什么只取头部批次？因为是按时间顺序进入队列的，
+                    // 如果头部批次没超时，后面的肯定也没有超时)
                     ProducerBatch batch = deque.getFirst();
+                    // 4. 判断批次是否超时了
                     if (batch.hasReachedDeliveryTimeout(deliveryTimeoutMs, now)) {
+                        //如果超时把这个批次从队列中移除
                         deque.poll();
+                        // 终止批次的写入 (假设批次还未写满)
                         batch.abortRecordAppends();
+                        // 将这个批次放到过期集合中
                         expiredBatches.add(batch);
                     } else {
+                        // 如果没有超时，则更新下个批次超时的具体时间
                         maybeUpdateNextBatchExpiryTime(batch);
                         break;
                     }
@@ -451,38 +492,54 @@ public final class RecordAccumulator {
      * </ol>
      */
     public ReadyCheckResult ready(Cluster cluster, long nowMs) {
+        // 1. 用来记录可以向哪些 Broker Node 节点发送数据
         Set<Node> readyNodes = new HashSet<>();
+        // 记录下次需要调用 ready() 方法的时间间隔
         long nextReadyCheckDelayMs = Long.MAX_VALUE;
+        // 记录 Cluster 元数据中找不到 Leader 的 topic
         Set<String> unknownLeaderTopics = new HashSet<>();
 
+        // 是否有线程在阻塞等待 BufferPool 来释放空间
         boolean exhausted = this.free.queued() > 0;
+        // 2. 遍历 batches 集合，对其中每个分区的 Leader 所在的 Broker Node 都进行判断
         for (Map.Entry<TopicPartition, Deque<ProducerBatch>> entry : this.batches.entrySet()) {
             Deque<ProducerBatch> deque = entry.getValue();
+            // 对 ArrayDeque<ProducerBatch> 加锁
             synchronized (deque) {
                 // When producing to a large number of partitions, this path is hot and deques are often empty.
                 // We check whether a batch exists first to avoid the more expensive checks whenever possible.
+                // 3. 获取 ArrayDeque 中第一个 ProducerBatch 对象，判断是否为空
                 ProducerBatch batch = deque.peekFirst();
                 if (batch != null) {
                     TopicPartition part = entry.getKey();
+                    // 4. 查找目标分区的 Leader 所在的节点
                     Node leader = cluster.leaderFor(part);
+                    // Leader 找不到，会认为是异常情况，不能发送消息
                     if (leader == null) {
                         // This is a partition for which leader is not known, but messages are available to send.
                         // Note that entries are currently not removed from batches when deque is empty.
                         unknownLeaderTopics.add(part.topic());
                     } else if (!readyNodes.contains(leader) && !isMuted(part)) {
                         long waitedTimeMs = batch.waitedTimeMs(nowMs);
+                        // retryBackoffMs:重试阻塞时间（默认：100）
+                        // lingerMs 发送延迟时间
                         boolean backingOff = batch.attempts() > 0 && waitedTimeMs < retryBackoffMs;
                         long timeToWaitMs = backingOff ? retryBackoffMs : lingerMs;
+                        // deque size大于 1 或第一个 batch 是否满了
                         boolean full = deque.size() > 1 || batch.isFull();
+                        // 消息在暂存队列里是否超时了
                         boolean expired = waitedTimeMs >= timeToWaitMs;
+                        // 5. 通过检查上述五个条件，判断是否可以发送，找到此次能发送的 Node
                         boolean sendable = full || expired || exhausted || closed || flushInProgress();
                         if (sendable && !backingOff) {
+                            // 6. 如果是能发送就将 Leader 加入 readyNodes 集合。
                             readyNodes.add(leader);
                         } else {
                             long timeLeftMs = Math.max(timeToWaitMs - waitedTimeMs, 0);
                             // Note that this results in a conservative estimate since an un-sendable partition may have
                             // a leader that will later be found to have sendable data. However, this is good enough
                             // since we'll just wake up and then sleep again for the remaining time.
+                            // 记录下次需要调用 ready() 方法检查的时间间隔
                             nextReadyCheckDelayMs = Math.min(timeLeftMs, nextReadyCheckDelayMs);
                         }
                     }
@@ -552,11 +609,16 @@ public final class RecordAccumulator {
     // 获取目标 Node 的 ProducerBatch 集合
     private List<ProducerBatch> drainBatchesForOneNode(Cluster cluster, Node node, int maxSize, long now) {
         int size = 0;
+        // 1. 获取当前 Node 上的所有分区集合
         List<PartitionInfo> parts = cluster.partitionsForNode(node.id());
+        // 2. 记录发往目标 Node 的 ProducerBatch 集合
         List<ProducerBatch> ready = new ArrayList<>();
         /* to make starvation less likely this loop doesn't start at 0 */
+        // drainIndex 是 batches 的下标，记录上次发送停止时的位置，下次继续从此位置开始发送。如果始终从
+        // 索引0的队列开始发送，可能会出现一直只发送前几个分区的消息的情况，造成其他分区饥饿。
         int start = drainIndex = drainIndex % parts.size();
         do {
+            // 3.获取partition的元数据
             PartitionInfo part = parts.get(drainIndex);
             TopicPartition tp = new TopicPartition(part.topic(), part.partition());
             this.drainIndex = (this.drainIndex + 1) % parts.size();
@@ -565,17 +627,20 @@ public final class RecordAccumulator {
             if (isMuted(tp))
                 continue;
 
+            // 4.获取主题分区对应的Deque
             Deque<ProducerBatch> deque = getDeque(tp);
             if (deque == null)
                 continue;
 
             synchronized (deque) {
                 // invariant: !isMuted(tp,now) && deque != null
+                // 获取ArrayDeque中第一个ProducerBatch对象
                 ProducerBatch first = deque.peekFirst();
                 if (first == null)
                     continue;
 
                 // first != null
+                // 重试操作的话，需要检查是否已经等待了足够的退避时间
                 boolean backoff = first.attempts() > 0 && first.waitedTimeMs(now) < retryBackoffMs;
                 // Only drain the batch if it is not during backoff period.
                 if (backoff)
@@ -584,6 +649,7 @@ public final class RecordAccumulator {
                 if (size + first.estimatedSizeInBytes() > maxSize && !ready.isEmpty()) {
                     // there is a rare case that a single batch size is larger than the request size due to
                     // compression; in this case we will still eventually send this batch in a single request
+                    // 此次请求要发送的数据量已满，结束循环
                     break;
                 } else {
                     if (shouldStopDrainBatchesForPartition(first, tp))
@@ -593,6 +659,7 @@ public final class RecordAccumulator {
                     boolean isTransactional = transactionManager != null && transactionManager.isTransactional();
                     ProducerIdAndEpoch producerIdAndEpoch =
                         transactionManager != null ? transactionManager.producerIdAndEpoch() : null;
+                    // 5. 获取ArrayDeque中第一个ProducerBatch
                     ProducerBatch batch = deque.pollFirst();
                     if (producerIdAndEpoch != null && !batch.hasSequence()) {
                         // If the batch already has an assigned sequence, then we should not change the producer id and
@@ -642,9 +709,12 @@ public final class RecordAccumulator {
         if (nodes.isEmpty())
             return Collections.emptyMap();
 
+        // 转换后的结果，Key是目标 Node 的 Id，Value是发送到目标 Node 的 ProducerBatch 集合
         Map<Integer, List<ProducerBatch>> batches = new HashMap<>();
         for (Node node : nodes) {
+            // 获取目标 Node 的 ProducerBatch 集合
             List<ProducerBatch> ready = drainBatchesForOneNode(cluster, node, maxSize, now);
+            // 添加到 batches 中
             batches.put(node.id(), ready);
         }
         return batches;
@@ -803,10 +873,12 @@ public final class RecordAccumulator {
         }
     }
 
+    // 对 tp 进行 mute， 保证只有一个 batch 正在发送，来保证顺序性。
     public void mutePartition(TopicPartition tp) {
         muted.add(tp);
     }
 
+    // 发送完成后进行 unmute, 这样 tp 才能进行下次发送
     public void unmutePartition(TopicPartition tp) {
         muted.remove(tp);
     }
@@ -832,6 +904,7 @@ public final class RecordAccumulator {
             this.future = future;
             this.batchIsFull = batchIsFull;
             this.newBatchCreated = newBatchCreated;
+            // 如果abortForNewBatch为 true，会再触发一次append()方法
             this.abortForNewBatch = abortForNewBatch;
         }
     }
@@ -844,9 +917,12 @@ public final class RecordAccumulator {
         public final long nextReadyCheckDelayMs;
         public final Set<String> unknownLeaderTopics;
 
+        // 主要返回 准备好发送的节点集合、找不到 Leader 分区的主题
         public ReadyCheckResult(Set<Node> readyNodes, long nextReadyCheckDelayMs, Set<String> unknownLeaderTopics) {
+            // 准备好发送的节点集合
             this.readyNodes = readyNodes;
             this.nextReadyCheckDelayMs = nextReadyCheckDelayMs;
+            // 找不到 Leader 分区的主题
             this.unknownLeaderTopics = unknownLeaderTopics;
         }
     }

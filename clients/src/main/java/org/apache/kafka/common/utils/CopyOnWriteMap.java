@@ -28,8 +28,10 @@ import java.util.concurrent.ConcurrentMap;
  */
 public class CopyOnWriteMap<K, V> implements ConcurrentMap<K, V> {
 
+    // volatile Map
     private volatile Map<K, V> map;
 
+    // 构造函数
     public CopyOnWriteMap() {
         this.map = Collections.emptyMap();
     }
@@ -38,6 +40,7 @@ public class CopyOnWriteMap<K, V> implements ConcurrentMap<K, V> {
         this.map = Collections.unmodifiableMap(map);
     }
 
+    // 判断队列是否存在
     @Override
     public boolean containsKey(Object k) {
         return map.containsKey(k);
@@ -53,6 +56,7 @@ public class CopyOnWriteMap<K, V> implements ConcurrentMap<K, V> {
         return map.entrySet();
     }
 
+    // 获取集合中队列
     @Override
     public V get(Object k) {
         return map.get(k);

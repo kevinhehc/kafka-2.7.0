@@ -57,23 +57,39 @@ public final class ProducerBatch {
 
     private static final Logger log = LoggerFactory.getLogger(ProducerBatch.class);
 
+    // 批次最终状态
     private enum FinalState { ABORTED, FAILED, SUCCEEDED }
 
+    // 批次创建时间
     final long createdMs;
+    // 批次对应的主题分区
     final TopicPartition topicPartition;
+    // 请求结果的future
     final ProduceRequestResult produceFuture;
 
+
+    // 用来存储消息的callback和响应数据
     private final List<Thunk> thunks = new ArrayList<>();
+    // 封装MemoryRecords对象，用来存储消息的ByteBuffer
     private final MemoryRecordsBuilder recordsBuilder;
+    // batch的失败重试次数
     private final AtomicInteger attempts = new AtomicInteger(0);
+    // 是否是被分裂的批次
     private final boolean isSplitBatch;
+    // ProducerBatch的最终状态
     private final AtomicReference<FinalState> finalState = new AtomicReference<>(null);
 
+    // Record个数
     int recordCount;
+    // 最大Record字节数
     int maxRecordSize;
+    // 最后一次失败重试发送的时间戳
     private long lastAttemptMs;
+    // 最后一次向该ProducerBatch追加Record的时间戳
     private long lastAppendTime;
+    // Sender子线程拉取批次的时间
     private long drainedMs;
+    // 是否正在重试过，如果ProducerBatch中的数据发送失败，则会重新尝试发送
     private boolean retry;
     private boolean reopened;
 
@@ -101,13 +117,17 @@ public final class ProducerBatch {
      * @return The RecordSend corresponding to this record or null if there isn't sufficient room.
      */
     public FutureRecordMetadata tryAppend(long timestamp, byte[] key, byte[] value, Header[] headers, Callback callback, long now) {
+        // 1.检查MemoryRecordsBuilder是否还有空间写入
         if (!recordsBuilder.hasRoomFor(timestamp, key, value, headers)) {
             return null;
         } else {
+            // 2.调用append()方法写入Record
             Long checksum = this.recordsBuilder.append(timestamp, key, value, headers);
+            // 3. 更新最大Record字节数
             this.maxRecordSize = Math.max(this.maxRecordSize, AbstractRecords.estimateSizeInBytesUpperBound(magic(),
                     recordsBuilder.compressionType(), key, value, headers));
             this.lastAppendTime = now;
+            // 4.构建FutureRecordMetadata对象
             FutureRecordMetadata future = new FutureRecordMetadata(this.produceFuture, this.recordCount,
                                                                    timestamp, checksum,
                                                                    key == null ? -1 : key.length,
@@ -115,8 +135,11 @@ public final class ProducerBatch {
                                                                    Time.SYSTEM);
             // we have to keep every future returned to the users in case the batch needs to be
             // split to several new batches and resent.
+            // 5. 将Callback和FutureRecordMetadata记录到thunks集合中
             thunks.add(new Thunk(callback, future));
+            // 6. 更新Record记录数
             this.recordCount++;
+            // 7. 返回FutureRecordMetadata
             return future;
         }
     }
@@ -185,6 +208,7 @@ public final class ProducerBatch {
      * @return true if the batch was completed successfully and false if the batch was previously aborted
      */
     public boolean done(long baseOffset, long logAppendTime, RuntimeException exception) {
+        // 1.根据exception决定本次ProducerBatch发送的最终状态
         final FinalState tryFinalState = (exception == null) ? FinalState.SUCCEEDED : FinalState.FAILED;
 
         if (tryFinalState == FinalState.SUCCEEDED) {
@@ -193,6 +217,7 @@ public final class ProducerBatch {
             log.trace("Failed to produce messages to {} with base offset {}.", topicPartition, baseOffset, exception);
         }
 
+        // 2.通过CAS操作更新finalState状态，只有第一次更新的时候，才会触发completeFutureAndFireCallbacks()方法
         if (this.finalState.compareAndSet(null, tryFinalState)) {
             completeFutureAndFireCallbacks(baseOffset, logAppendTime, exception);
             return true;
@@ -217,17 +242,22 @@ public final class ProducerBatch {
 
     private void completeFutureAndFireCallbacks(long baseOffset, long logAppendTime, RuntimeException exception) {
         // Set the future before invoking the callbacks as we rely on its state for the `onCompletion` call
+        // 1.更新ProduceRequestResult中的相关字段
         produceFuture.set(baseOffset, logAppendTime, exception);
 
         // execute callbacks
+        // 2.遍历thunks集合，触发每个Record的Callback回调
         for (Thunk thunk : thunks) {
             try {
                 if (exception == null) {
+                    // 3.获取消息元数据
                     RecordMetadata metadata = thunk.future.value();
                     if (thunk.callback != null)
+                        //4.调用回调方法
                         thunk.callback.onCompletion(metadata, null);
                 } else {
                     if (thunk.callback != null)
+                        // 4.调用回调方法
                         thunk.callback.onCompletion(null, exception);
                 }
             } catch (Exception e) {
