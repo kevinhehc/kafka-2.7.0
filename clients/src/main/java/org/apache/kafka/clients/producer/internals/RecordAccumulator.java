@@ -378,12 +378,15 @@ public final class RecordAccumulator {
      * whether the batch has reached deliveryTimeoutMs or not. Hence we do not do the delivery timeout check here.
      */
     public void reenqueue(ProducerBatch batch, long now) {
+        // 批次重新入队
         batch.reenqueued(now);
+        // 获取 ArrayDeque<ProducerBatch>
         Deque<ProducerBatch> deque = getOrCreateDeque(batch.topicPartition);
         synchronized (deque) {
             if (transactionManager != null)
                 insertInSequenceOrder(deque, batch);
             else
+                // 添加到队首
                 deque.addFirst(batch);
         }
     }

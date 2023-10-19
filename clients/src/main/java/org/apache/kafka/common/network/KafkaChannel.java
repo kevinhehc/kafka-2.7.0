@@ -176,13 +176,19 @@ public class KafkaChannel implements AutoCloseable {
      * For SSL with client authentication enabled, {@link TransportLayer#handshake()} performs
      * authentication. For SASL, authentication is performed by {@link Authenticator#authenticate()}.
      */
+    // 连接准备
     public void prepare() throws AuthenticationException, IOException {
         boolean authenticating = false;
         try {
+            // 通过没有ready
             if (!transportLayer.ready())
+                // 进行握手操作
                 transportLayer.handshake();
+            // 已经ready 但是没有认证
             if (transportLayer.ready() && !authenticator.complete()) {
+                // 开启认证中标识
                 authenticating = true;
+                // 开始认证
                 authenticator.authenticate();
             }
         } catch (AuthenticationException e) {
@@ -196,8 +202,11 @@ public class KafkaChannel implements AutoCloseable {
             }
             throw e;
         }
+        // 准备好以后
         if (ready()) {
+            // 计算认证成功数
             ++successfulAuthentications;
+            // 状态改为ready
             state = ChannelState.READY;
         }
     }
@@ -391,12 +400,18 @@ public class KafkaChannel implements AutoCloseable {
         this.transportLayer.addInterestOps(SelectionKey.OP_WRITE);
     }
 
+    // 可能完成发送
     public Send maybeCompleteSend() {
+        // send 不为空且已经发送完毕
         if (send != null && send.completed()) {
             midWrite = false;
+            // 当写数据完毕后，取消传输层对 OP_WRITE 事件的监听，完成一次写操作
             transportLayer.removeInterestOps(SelectionKey.OP_WRITE);
+            // 将 send 赋值给结果集 result
             Send result = send;
+            // 此时读完后将 send 清空，以便下次写
             send = null;
+            // 最后返回结果集 result，完成一次写操作
             return result;
         }
         return null;
@@ -423,6 +438,10 @@ public class KafkaChannel implements AutoCloseable {
         return receive;
     }
 
+
+    // 判断 NetworkReceive 对象是否已经读完了
+    // 如果此时并没有读完一个完整的NetworkReceive对象,则下次触发读事件会继续填充整个NetworkReceive对象，
+    // 如果读完一个完整的NetworkReceive对象则将其置空，下次触发读事件时会创建一个全新的NetworkReceive对象。
     public NetworkReceive maybeCompleteReceive() {
         if (receive != null && receive.complete()) {
             receive.payload().rewind();
@@ -475,6 +494,7 @@ public class KafkaChannel implements AutoCloseable {
     /**
      * @return true if underlying transport has bytes remaining to be read from any underlying intermediate buffers.
      */
+    // 判断 channel 是否有缓存数据
     public boolean hasBytesBuffered() {
         return transportLayer.hasBytesBuffered();
     }

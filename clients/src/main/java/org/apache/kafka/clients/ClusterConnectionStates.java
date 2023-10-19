@@ -72,11 +72,15 @@ final class ClusterConnectionStates {
      * @param now the current time in ms
      * @return true if we can initiate a new connection
      */
+    //  判断连接状态
     public boolean canConnect(String id, long now) {
+        // 获取对应节点的连接状态
         NodeConnectionState state = nodeState.get(id);
         if (state == null)
             return true;
         else
+            // 首先连接必须是 isDisconnected，不能是 connecteding 状态，即客户端与服务端的连接状态是没有连接上
+            // &&  两次重试之间时间差要大于重试退避时间，目的就是为了避免网络拥塞，防止重连过于频繁造成网络压力过大
             return state.state.isDisconnected() &&
                    now - state.lastConnectAttemptMs >= state.reconnectBackoffMs;
     }
@@ -141,12 +145,16 @@ final class ClusterConnectionStates {
      * @param clientDnsLookup the mode of DNS lookup to use when resolving the {@code host}
      */
     public void connecting(String id, long now, String host, ClientDnsLookup clientDnsLookup) {
+        // 获取对应节点的连接状态
         NodeConnectionState connectionState = nodeState.get(id);
+        // 节点状态不为空 && 节点状态对应 host 能匹配上
         if (connectionState != null && connectionState.host().equals(host)) {
             connectionState.lastConnectAttemptMs = now;
+            // 节点状态改为正在连接
             connectionState.state = ConnectionState.CONNECTING;
             // Move to next resolved address, or if addresses are exhausted, mark node to be re-resolved
             connectionState.moveToNextAddress();
+            // 添加到正在连接节点集合中
             connectingNodes.add(id);
             return;
         } else if (connectionState != null) {
@@ -174,16 +182,24 @@ final class ClusterConnectionStates {
      * @param id the connection we have disconnected
      * @param now the current time in ms
      */
+    // 断开连接状态
     public void disconnected(String id, long now) {
+        // 获取对应节点的连接状态
         NodeConnectionState nodeState = nodeState(id);
         nodeState.lastConnectAttemptMs = now;
+        // 修改重试退避时间
         updateReconnectBackoff(nodeState);
+        // 如果连接状态为正在连接
         if (nodeState.state == ConnectionState.CONNECTING) {
+            // 修改节点超时时间
             updateConnectionSetupTimeout(nodeState);
+            // 移除正在连接节点
             connectingNodes.remove(id);
         } else {
+            // 重置节点超时时间
             resetConnectionSetupTimeout(nodeState);
         }
+        // 处理节点连接状态为 DISCONNECTED，并更新超时时间和重试退避时间
         nodeState.state = ConnectionState.DISCONNECTED;
     }
 
@@ -247,11 +263,16 @@ final class ClusterConnectionStates {
      * @param id the connection identifier
      */
     public void ready(String id) {
+        // 获取对应节点的连接状态
         NodeConnectionState nodeState = nodeState(id);
+        // 设置节点状态为ready
         nodeState.state = ConnectionState.READY;
         nodeState.authenticationException = null;
+        // 重置重连退避时间
         resetReconnectBackoff(nodeState);
+        // 重置连接超时时间
         resetConnectionSetupTimeout(nodeState);
+        // 当连接准备好后从正在连接节点集合中删除
         connectingNodes.remove(id);
     }
 
@@ -280,6 +301,7 @@ final class ClusterConnectionStates {
     }
 
     private boolean isReady(NodeConnectionState state, long now) {
+        // 状态不为空 && 状态已准备好 && 节流时间等于小于当前时间
         return state != null && state.state == ConnectionState.READY && state.throttleUntilTimeMs <= now;
     }
 
@@ -343,7 +365,9 @@ final class ClusterConnectionStates {
      * @param nodeState The node state object to update
      */
     private void resetConnectionSetupTimeout(NodeConnectionState nodeState) {
+        // 重置节点失败计数
         nodeState.failedConnectAttempts = 0;
+        // 连接超时时间为初始时间
         nodeState.connectionSetupTimeoutMs = connectionSetupTimeout.backoff(0);
     }
 
@@ -368,7 +392,9 @@ final class ClusterConnectionStates {
      * @param nodeState The node state object to update
      */
     private void updateConnectionSetupTimeout(NodeConnectionState nodeState) {
+        // 递增失败次数
         nodeState.failedConnectAttempts++;
+        // 修改节点连接超时时间
         nodeState.connectionSetupTimeoutMs = connectionSetupTimeout.backoff(nodeState.failedConnectAttempts);
     }
 
@@ -446,6 +472,7 @@ final class ClusterConnectionStates {
      * Return the Set of nodes whose connection setup has timed out.
      * @param now the current time in ms
      */
+    // 收集超时连接的节点集合: 从正在连接的节点集合中迭代出超时连接的节点集合
     public Set<String> nodesWithConnectionSetupTimeout(long now) {
         return connectingNodes.stream()
             .filter(id -> isConnectionSetupTimeout(id, now))

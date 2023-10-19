@@ -27,14 +27,19 @@ import org.apache.kafka.common.requests.RequestHeader;
  */
 public class ClientResponse {
 
+    // 请求头
     private final RequestHeader requestHeader;
+    // 回调函数，由 clientRequest 来指定
     private final RequestCompletionHandler callback;
+    // 目标节点地址
     private final String destination;
+    // 接受时间
     private final long receivedTimeMs;
     private final long latencyMs;
     private final boolean disconnected;
     private final UnsupportedVersionException versionMismatch;
     private final AuthenticationException authenticationException;
+    // 响应体
     private final AbstractResponse responseBody;
 
     /**
@@ -104,8 +109,10 @@ public class ClientResponse {
         return latencyMs;
     }
 
+    // 响应完成的回调函数
     public void onComplete() {
         if (callback != null)
+            // 调用 requestCompletionHandler 回调
             callback.onComplete(this);
     }
 

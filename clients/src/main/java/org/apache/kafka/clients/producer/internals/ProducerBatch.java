@@ -359,7 +359,10 @@ public final class ProducerBatch {
         return "ProducerBatch(topicPartition=" + topicPartition + ", recordCount=" + recordCount + ")";
     }
 
+    //  判断投递是否超时
     boolean hasReachedDeliveryTimeout(long deliveryTimeoutMs, long now) {
+        // 超时的标准：now - createMs > deliveryTimeoutMS
+        // 当前时间 - 批次的创建时间 > 投递过期时间(默认120秒)
         return deliveryTimeoutMs <= now - this.createdMs;
     }
 

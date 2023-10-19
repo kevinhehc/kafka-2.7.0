@@ -24,15 +24,24 @@ import org.apache.kafka.common.requests.RequestHeader;
 /**
  * A request being sent to the server. This holds both the network send as well as the client-level metadata.
  */
+// ClientRequest 是客户端的请求，封装了 requestBuilder
 public final class ClientRequest {
 
+    // 节点地址
     private final String destination;
+    // ClientRequest 中通过 requestBuilder 给不同类型的请求设置不同的请求内容
     private final AbstractRequest.Builder<?> requestBuilder;
+    // 请求头的 correlationId
     private final int correlationId;
+    // 请求头的 clientid
     private final String clientId;
+    // 创建时间
     private final long createdTimeMs;
+    // 是否需要进行响应
     private final boolean expectResponse;
+    // 请求的超时时间
     private final int requestTimeoutMs;
+    // 回调函数 用来处理响应
     private final RequestCompletionHandler callback;
 
     /**

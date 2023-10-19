@@ -46,6 +46,7 @@ public class PlaintextTransportLayer implements TransportLayer {
         this.socketChannel = (SocketChannel) key.channel();
     }
 
+    // 明文传输永远返回true
     @Override
     public boolean ready() {
         return true;
@@ -218,6 +219,7 @@ public class PlaintextTransportLayer implements TransportLayer {
         return key.isValid() && (key.interestOps() & SelectionKey.OP_READ) == 0;
     }
 
+    // 明文传输永远返回true
     @Override
     public boolean hasBytesBuffered() {
         return false;

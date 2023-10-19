@@ -22,6 +22,10 @@ package org.apache.kafka.clients;
  */
 public interface RequestCompletionHandler {
 
+    // 接口 RequestCompletionHandler 就一个方法 onComplete()，
+    // 上面 callback 对 onComplete() 的实现主要是用返回值 response 当参数调用 handleProduceResponse()方法。
+    // 消息发送的时候并不会把 callback 方法发送到 Broker 端，
+    // 而是把 callback 放在 NetworkClient 里等待响应回来后根据响应去调用 callback。
     public void onComplete(ClientResponse response);
 
 }
