@@ -54,31 +54,44 @@ import scala.collection._
 import scala.collection.mutable.ArrayBuffer
 import scala.jdk.CollectionConverters._
 
-class GroupMetadataManager(brokerId: Int,
+class GroupMetadataManager(brokerId: Int,   // 所在 Broker Id，即 broker.id 参数值
+
+                           // 保存 Broker 间通讯使用的请求版本。它是 Broker 端参数 inter.broker.protocol.version 值，
+                           // 主要为了确定位移主题消息格式的版本。
                            interBrokerProtocolVersion: ApiVersion,
+
+                           // 内部位移主题 __consumer_offsets 配置类，包含了与位移管理相关的重要参数比如：
+                           // 位移主题日志段大小设置、位移主题备份因子、位移主题分区数配置等。
                            config: OffsetConfig,
+
+                           // 副本管理器类，用来获取分区对象、日志对象以及写入分区消息的目的。
                            val replicaManager: ReplicaManager,
                            zkClient: KafkaZkClient,
                            time: Time,
                            metrics: Metrics) extends Logging with KafkaMetricsGroup {
 
+  // 压缩器类型，主要向位移主题 __consumer_offsets 写入消息时执行压缩操作
   private val compressionType: CompressionType = CompressionType.forId(config.offsetsTopicCompressionCodec.codec)
 
+  // 消费者组元数据容器，内部保存 Broker 管理的所有消费者组的数据
   private val groupMetadataCache = new Pool[String, GroupMetadata]
 
   /* lock protecting access to loading and owned partition sets */
   private val partitionLock = new ReentrantLock()
 
   /* partitions of consumer groups that are being loaded, its lock should be always called BEFORE the group lock if needed */
+  // 位移主题 __consumer_offsets 下正在执行加载操作的分区
   private val loadingPartitions: mutable.Set[Int] = mutable.Set()
 
   /* partitions of consumer groups that are assigned, using the same loading partition lock */
+  // 位移主题 __consumer_offsets 下完成加载操作的分区
   private val ownedPartitions: mutable.Set[Int] = mutable.Set()
 
   /* shutting down flag */
   private val shuttingDown = new AtomicBoolean(false)
 
   /* number of partitions for the consumer metadata topic */
+  // 位移主题 __consumer_offsets 总分区数
   private val groupMetadataTopicPartitionCount = getGroupMetadataTopicPartitionCount
 
   /* single-thread scheduler to handle offset/group metadata cache loading and unloading */
@@ -171,10 +184,16 @@ class GroupMetadataManager(brokerId: Int,
       }
     })
 
+  // 启动时执行必要的初始化操作，包括获取主题分区数和启动元数据过期功能。
   def startup(enableMetadataExpiration: Boolean): Unit = {
+    // 启动消费者组元数据管理调度器。
     scheduler.startup()
+    // 如果启用了元数据过期功能
     if (enableMetadataExpiration) {
+      // 使用调度器定期执行 cleanupGroupMetadata() 方法，以清理过期的组元数据。
+      // config.offsetsRetentionCheckIntervalMs：配置的偏移量保留检查间隔时间。
       scheduler.schedule(name = "delete-expired-group-metadata",
+        // 调度器会按照设定的时间间隔执行 cleanupGroupMetadata() 方法。
         fun = () => cleanupGroupMetadata(),
         period = config.offsetsRetentionCheckIntervalMs,
         unit = TimeUnit.MILLISECONDS)
@@ -213,6 +232,7 @@ class GroupMetadataManager(brokerId: Int,
   /**
    * Get the group associated with the given groupId or null if not found
    */
+    // 返回给定消费者组的元数据信息，若该组信息不存在，返回 None
   def getGroup(groupId: String): Option[GroupMetadata] = {
     Option(groupMetadataCache.get(groupId))
   }
@@ -221,10 +241,12 @@ class GroupMetadataManager(brokerId: Int,
    * Get the group associated with the given groupId - the group is created if createIfNotExist
    * is true - or null if not found
    */
+    // 返回给定消费者组的元数据信息，若不存在，则需要根据 createIfNotExist 参数值决定是否需要添加该消费者组
   def getOrMaybeCreateGroup(groupId: String, createIfNotExist: Boolean): Option[GroupMetadata] = {
-    if (createIfNotExist)
+    if (createIfNotExist) {
+      //  // 若不存在且允许添加，则添加一个状态是 Empty 的消费者组元数据对象
       Option(groupMetadataCache.getAndMaybePut(groupId, new GroupMetadata(groupId, Empty, time)))
-    else
+    } else
       Option(groupMetadataCache.get(groupId))
   }
 
@@ -232,6 +254,7 @@ class GroupMetadataManager(brokerId: Int,
    * Add a group or get the group associated with the given groupId if it already exists
    */
   def addGroup(group: GroupMetadata): GroupMetadata = {
+    // 调用 putIfNotExists 将给定组添加到 groupMetadataCache 中
     val currentGroup = groupMetadataCache.putIfNotExists(group.groupId, group)
     if (currentGroup != null) {
       currentGroup
@@ -758,25 +781,38 @@ class GroupMetadataManager(brokerId: Int,
    */
   def removeGroupsForPartition(offsetsPartition: Int,
                                onGroupUnloaded: GroupMetadata => Unit): Unit = {
+    // Kafka 位移主题分区
     val topicPartition = new TopicPartition(Topic.GROUP_METADATA_TOPIC_NAME, offsetsPartition)
     info(s"Scheduling unloading of offsets and group metadata from $topicPartition")
+    // 创建异步任务，移除组信息和位移信息
     scheduler.schedule(topicPartition.toString, () => removeGroupsAndOffsets())
 
+    // 用来移除消费者组信息和位移信息
     def removeGroupsAndOffsets(): Unit = {
+      // 移除位移数量
       var numOffsetsRemoved = 0
+      // 移除消费者组数量
       var numGroupsRemoved = 0
 
       inLock(partitionLock) {
         // we need to guard the group removal in cache in the loading partition lock
         // to prevent coordinator's check-and-get-group race condition
+        // 移除位移主题 __consumer_offsets 下完成加载操作的分区集合中特定位移主题分区记录
         ownedPartitions.remove(offsetsPartition)
 
+        // 遍历所有消费者组信息
         for (group <- groupMetadataCache.values) {
+          // 如果该组信息保存在特定位移主题分区中
           if (partitionFor(group.groupId) == offsetsPartition) {
+            // 执行组卸载逻辑
             onGroupUnloaded(group)
+            // 将组信息从 groupMetadataCache 中移除
             groupMetadataCache.remove(group.groupId, group)
+            // 把消费者组从 producer 对应的消费者组集合中移除
             removeGroupFromAllProducers(group.groupId)
+            // 递增已移除组计数器
             numGroupsRemoved += 1
+            // 递增已移除位移值计数器
             numOffsetsRemoved += group.numOffsets
           }
         }

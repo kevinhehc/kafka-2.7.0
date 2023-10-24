@@ -85,32 +85,51 @@ import java.util.stream.Collectors;
  * This class manages the coordination process with the consumer coordinator.
  */
 public final class ConsumerCoordinator extends AbstractCoordinator {
+    // 消费者组重平衡的配置信息
     private final GroupRebalanceConfig rebalanceConfig;
     private final Logger log;
+    // 订阅分区任务列表
     private final List<ConsumerPartitionAssignor> assignors;
+    // 消费者元数据
     private final ConsumerMetadata metadata;
+    // 消费者协调器的指标信息
     private final ConsumerCoordinatorMetrics sensors;
+    // 订阅状态，保存了主题分区和 offset 的对应关系。
     private final SubscriptionState subscriptions;
+    // 默认的偏移量提交回调
     private final OffsetCommitCallback defaultOffsetCommitCallback;
+    // 是否启用自动偏移量提交
     private final boolean autoCommitEnabled;
+    // 自动偏移量提交的间隔时间。
     private final int autoCommitIntervalMs;
+    // 消费者拦截器
     private final ConsumerInterceptors<?, ?> interceptors;
+    // 待处理的异步提交偏移量的数量计数器
     private final AtomicInteger pendingAsyncCommits;
 
     // this collection must be thread-safe because it is modified from the response handler
     // of offset commit requests, which may be invoked from the heartbeat thread
+    // 异步提交偏移量完成的队列，线程安全的
     private final ConcurrentLinkedQueue<OffsetCommitCompletion> completedOffsetCommits;
 
+    // 是否为消费者组的 Leader
     private boolean isLeader = false;
+    // 加入消费者组的订阅信息
     private Set<String> joinedSubscription;
+    // 元数据的快照，保存分区信息，用来监控分区信息是否变了。
     private MetadataSnapshot metadataSnapshot;
+    // 分配结果的快照，保存分区分配结果。
     private MetadataSnapshot assignmentSnapshot;
+    // 下一次自动提交偏移量的定时器
     private Timer nextAutoCommitTimer;
+    // 标识异步提交偏移量是否被取消。
     private AtomicBoolean asyncCommitFenced;
+    // 消费组元数据
     private ConsumerGroupMetadata groupMetadata;
     private final boolean throwOnFetchStableOffsetsUnsupported;
 
     // hold onto request&future for committed offset requests to enable async calls.
+    // 等待处理的提交偏移量请求。
     private PendingCommittedOffsetRequest pendingCommittedOffsetRequest = null;
 
     private static class PendingCommittedOffsetRequest {

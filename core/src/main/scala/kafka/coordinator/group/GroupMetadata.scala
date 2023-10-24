@@ -164,17 +164,17 @@ private object GroupMetadata extends Logging {
 /**
  * Case class used to represent group metadata for the ListGroups API
  */
-case class GroupOverview(groupId: String,
-                         protocolType: String,
-                         state: String)
+case class GroupOverview(groupId: String, // 组ID信息，即group.id参数值
+                         protocolType: String, // 消费者组的协议类型
+                         state: String)  // 消费者组的状态
 
 /**
  * Case class used to represent group metadata for the DescribeGroup API
  */
-case class GroupSummary(state: String,
-                        protocolType: String,
-                        protocol: String,
-                        members: List[MemberSummary])
+case class GroupSummary(state: String,        // 消费者组状态
+                        protocolType: String, // 协议类型
+                        protocol: String,     // 消费者组选定的分区分配策略
+                        members: List[MemberSummary])  // 成员元数据
 
 /**
   * We cache offset commits along with their commit record offset. This enables us to ensure that the latest offset
@@ -213,24 +213,37 @@ private[group] class GroupMetadata(val groupId: String, initialState: GroupState
   var currentStateTimestamp: Option[Long] = Some(time.milliseconds())
   var protocolType: Option[String] = None
   var protocolName: Option[String] = None
+  // 消费组 Generation 号。Generation 等同于消费者组执行过 Rebalance 操作的次数，每次执行 Rebalance时，Generation 数都要加 1。
   var generationId = 0
+  // 消费者组中 Leader 成员的 Member ID 信息。当消费者组执行 Rebalance 过程时，需要选举一个成员作为Leader，负责为所有成员制定分区分配方案。
+  // 在 Rebalance 早期阶段，这个 Leader 可能尚未被选举出来则为 None。
   private var leaderId: Option[String] = None
 
+  // 保存消费者组下所有成员的元数据列表信息。
   private val members = new mutable.HashMap[String, MemberMetadata]
   // Static membership mapping [key: group.instance.id, value: member.id]
+  // 静态成员 Id 列表。
   private val staticMembers = new mutable.HashMap[String, String]
+  // 待加入的成员 Id 列表。
   private val pendingMembers = new mutable.HashSet[String]
+  // 正在等待加入 Group 的成员数量。
   private var numMembersAwaitingJoin = 0
+  // 保存分区分配策略的支持票数。它是一个 HashMap 类型，其中，Key 是分配策略的名称，Value是 支持的票数。
   private val supportedProtocols = new mutable.HashMap[String, Integer]().withDefaultValue(0)
   // 保存消费者组订阅分区的提交位移值
+  // 保存按照主题分区分组的位移主题消息位移值的 HashMap。其中 Key 是主题分区，Value 是CommitRecordMetadataAndOffset 类型。
+  // 当消费者组成员向 Kafka 提交位移时，插入对应的记录到该字段。
   private val offsets = new mutable.HashMap[TopicPartition, CommitRecordMetadataAndOffset]
+  // 保存待提交的偏移量。
   private val pendingOffsetCommits = new mutable.HashMap[TopicPartition, OffsetAndMetadata]
   private val pendingTransactionalOffsetCommits = new mutable.HashMap[Long, mutable.Map[TopicPartition, CommitRecordMetadataAndOffset]]()
   private var receivedTransactionalOffsetCommits = false
+  // 标志是否已接收到消费者的提交的偏移量。
   private var receivedConsumerOffsetCommits = false
 
   // When protocolType == `consumer`, a set of subscribed topics is maintained. The set is
   // computed when a new generation is created or when the group is restored from the log.
+  // 保存消费者组订阅的主题列表，用于帮助从offsets字段中过滤订阅主题分区的位移值。
   private var subscribedTopics: Option[Set[String]] = None
 
   var newMemberAdded: Boolean = false

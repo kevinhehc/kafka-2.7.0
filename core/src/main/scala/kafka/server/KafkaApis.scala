@@ -1710,7 +1710,9 @@ class KafkaApis(val requestChannel: RequestChannel, // 请求通道
     }
   }
 
+  // 处理 SyncGroupRequest 请求，该请求用于同步消费者组内成员的分区分配信息
   def handleSyncGroupRequest(request: RequestChannel.Request): Unit = {
+    // 从请求中获取 SyncGroupRequest 对象
     val syncGroupRequest = request.body[SyncGroupRequest]
 
     def sendResponseCallback(syncGroupResult: SyncGroupResult): Unit = {
@@ -1725,17 +1727,21 @@ class KafkaApis(val requestChannel: RequestChannel, // 请求通道
         ))
     }
 
+    // 如果当前 Broker 的版本低于 2.3，且 SyncGroupRequest 包含了 groupInstanceId 属性，直接返回错误响应
     if (syncGroupRequest.data.groupInstanceId != null && config.interBrokerProtocolVersion < KAFKA_2_3_IV0) {
       // Only enable static membership when IBP >= 2.3, because it is not safe for the broker to use the static member logic
       // until we are sure that all brokers support it. If static group being loaded by an older coordinator, it will discard
       // the group.instance.id field, so static members could accidentally become "dynamic", which leads to wrong states.
       sendResponseCallback(SyncGroupResult(Errors.UNSUPPORTED_VERSION))
     } else if (!syncGroupRequest.areMandatoryProtocolTypeAndNamePresent()) {
+      // 如果 SyncGroupRequest 缺少 ProtocolType 或 ProtocolName 字段，则返回错误响应
       // Starting from version 5, ProtocolType and ProtocolName fields are mandatory.
       sendResponseCallback(SyncGroupResult(Errors.INCONSISTENT_GROUP_PROTOCOL))
     } else if (!authorize(request.context, READ, GROUP, syncGroupRequest.data.groupId)) {
+      // 如果消费者没有授权 SyncGroupRequest 的操作，则返回错误响应
       sendResponseCallback(SyncGroupResult(Errors.GROUP_AUTHORIZATION_FAILED))
     } else {
+      // 否则，则通过 GroupCoordinator 对象处理 SyncGroupRequest 请求
       val assignmentMap = immutable.Map.newBuilder[String, Array[Byte]]
       syncGroupRequest.data.assignments.forEach { assignment =>
         assignmentMap += (assignment.memberId -> assignment.assignment)
