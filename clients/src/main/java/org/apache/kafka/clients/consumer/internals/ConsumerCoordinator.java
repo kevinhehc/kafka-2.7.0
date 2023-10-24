@@ -217,12 +217,17 @@ public final class ConsumerCoordinator extends AbstractCoordinator {
         JoinGroupRequestData.JoinGroupRequestProtocolCollection protocolSet = new JoinGroupRequestData.JoinGroupRequestProtocolCollection();
 
         List<String> topics = new ArrayList<>(joinedSubscription);
+        // assignors 是配置 partition.assignment.strategy 的分区分配策略
         for (ConsumerPartitionAssignor assignor : assignors) {
             Subscription subscription = new Subscription(topics,
+                    // 分配策略的用户自定义数据,需要实现 subscriptionUserData 方法,默认 range 策略是 null
                                                          assignor.subscriptionUserData(joinedSubscription),
+                    // 订阅的所有分区列表
                                                          subscriptions.assignedPartitionsList());
+            // 包含了订阅的Topic、UserData 和经过分组整理的订阅的 Topic 分区列表，并且序列化成ByteBuffer
             ByteBuffer metadata = ConsumerProtocol.serializeSubscription(subscription);
 
+            // 组装成每种策略对应的订阅信息数据
             protocolSet.add(new JoinGroupRequestData.JoinGroupRequestProtocol()
                     .setName(assignor.name())
                     .setMetadata(Utils.toArray(metadata)));

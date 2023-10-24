@@ -626,6 +626,7 @@ public class Fetcher<K, V> implements Closeable {
         Queue<CompletedFetch> pausedCompletedFetches = new ArrayDeque<>();
         // 2、定义变量 recordsRemaining，表示一次获取多少个消息，也就是 fetched 变量里的消息数量。
         //    这个参数可以通过配置文件进行修改，对应配置文件的参数是 max.poll.records，默认值是 500。
+        //    每次拉 500
         int recordsRemaining = maxPollRecords;
 
         try {

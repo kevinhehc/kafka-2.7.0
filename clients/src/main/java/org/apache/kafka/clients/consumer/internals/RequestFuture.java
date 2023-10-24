@@ -126,6 +126,7 @@ public class RequestFuture<T> implements ConsumerNetworkClient.PollCondition {
 
             if (!result.compareAndSet(INCOMPLETE_SENTINEL, value))
                 throw new IllegalStateException("Invalid attempt to complete a request future which is already complete");
+            // 关键调用，用来处理成功的响应。
             fireSuccess();
         } finally {
             completedLatch.countDown();
@@ -163,9 +164,11 @@ public class RequestFuture<T> implements ConsumerNetworkClient.PollCondition {
     private void fireSuccess() {
         T value = value();
         while (true) {
+            // 取出所有的监听器
             RequestFutureListener<T> listener = listeners.poll();
             if (listener == null)
                 break;
+            // 调用onSuccess()方法处理响应
             listener.onSuccess(value);
         }
     }
@@ -185,6 +188,7 @@ public class RequestFuture<T> implements ConsumerNetworkClient.PollCondition {
      * @param listener non-null listener to add
      */
     public void addListener(RequestFutureListener<T> listener) {
+        // 添加到监听器中
         this.listeners.add(listener);
         if (failed())
             fireFailure();
@@ -199,7 +203,9 @@ public class RequestFuture<T> implements ConsumerNetworkClient.PollCondition {
      * @return The new future
      */
     public <S> RequestFuture<S> compose(final RequestFutureAdapter<T, S> adapter) {
+        // 适配之后的结果
         final RequestFuture<S> adapted = new RequestFuture<>();
+        // 在当前 RequestFuture 中添加监听器。
         addListener(new RequestFutureListener<T>() {
             @Override
             public void onSuccess(T value) {
@@ -215,14 +221,17 @@ public class RequestFuture<T> implements ConsumerNetworkClient.PollCondition {
     }
 
     public void chain(final RequestFuture<T> future) {
+        // 添加监听器
         addListener(new RequestFutureListener<T>() {
             @Override
             public void onSuccess(T value) {
+                // 通过监听器将 value 传递给下一个 RequestFuture 对象
                 future.complete(value);
             }
 
             @Override
             public void onFailure(RuntimeException e) {
+                // 通过监听器将异常传递给下一个 RequestFuture 对象
                 future.raise(e);
             }
         });

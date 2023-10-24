@@ -112,6 +112,7 @@ public abstract class AbstractCoordinator implements Closeable {
     public static final String HEARTBEAT_THREAD_PREFIX = "kafka-coordinator-heartbeat-thread";
     public static final int JOIN_GROUP_TIMEOUT_LAPSE = 5000;
 
+    // 消费端成员状态
     protected enum MemberState {
         UNJOINED,             // the client is not part of a group
         PREPARING_REBALANCE,  // the client has sent the join group request, but have not received response

@@ -186,7 +186,9 @@ public class SubscriptionState {
     }
 
     public synchronized void subscribe(Pattern pattern, ConsumerRebalanceListener listener) {
+        // 注册重平衡监听器
         registerRebalanceListener(listener);
+        // 按照设置的主题开始订阅，自动分配分区
         setSubscriptionType(SubscriptionType.AUTO_PATTERN);
         this.subscribedPattern = pattern;
     }
