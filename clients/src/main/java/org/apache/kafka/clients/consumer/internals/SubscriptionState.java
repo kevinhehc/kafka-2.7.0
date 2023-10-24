@@ -72,25 +72,37 @@ public class SubscriptionState {
 
     private final Logger log;
 
+    // 表示订阅 Topic 的模式，分以下四类：
     private enum SubscriptionType {
-        NONE, AUTO_TOPICS, AUTO_PATTERN, USER_ASSIGNED
+        //初始值。
+        NONE,
+        //按指定的 Topic 进行订阅，自动分配分区。
+        AUTO_TOPICS,
+        //按正则表达式匹配的 topic 进行订阅，自动分配分区。
+        AUTO_PATTERN,
+        //用户自己定制消费者要消费的 topic 和分区。
+        USER_ASSIGNED
     }
 
     /* the type of subscription */
     private SubscriptionType subscriptionType;
 
     /* the pattern user has requested */
+    /* 用来过滤 topic 的正则表达式 */
     private Pattern subscribedPattern;
 
     /* the list of topics the user has requested */
+    /* 用户手动写的要订阅的 topic */
     private Set<String> subscription;
 
     /* The list of topics the group has subscribed to. This may include some topics which are not part
      * of `subscription` for the leader of a group since it is responsible for detecting metadata changes
      * which require a group rebalance. */
+    /* 消费组订阅的所有 topic */
     private Set<String> groupSubscription;
 
     /* the partitions that are currently assigned, note that the order of partition matters (see FetchBuilder for more details) */
+    /* 记录消费者里主题分区的状态集合 */
     private final PartitionStates<TopicPartitionState> assignment;
 
     /* Default offset reset strategy */
@@ -127,6 +139,7 @@ public class SubscriptionState {
         }
     }
 
+    // 构造方法
     public SubscriptionState(LogContext logContext, OffsetResetStrategy defaultResetStrategy) {
         this.log = logContext.logger(this.getClass());
         this.defaultResetStrategy = defaultResetStrategy;
@@ -134,6 +147,7 @@ public class SubscriptionState {
         this.assignment = new PartitionStates<>();
         this.groupSubscription = new HashSet<>();
         this.subscribedPattern = null;
+        // 默认设置订阅模式为 NONE。
         this.subscriptionType = SubscriptionType.NONE;
     }
 
@@ -155,14 +169,19 @@ public class SubscriptionState {
      */
     private void setSubscriptionType(SubscriptionType type) {
         if (this.subscriptionType == SubscriptionType.NONE)
+            // 按照设置的主题开始订阅，自动分配分区
             this.subscriptionType = type;
         else if (this.subscriptionType != type)
+            // 否则抛异常
             throw new IllegalStateException(SUBSCRIPTION_EXCEPTION_MESSAGE);
     }
 
     public synchronized boolean subscribe(Set<String> topics, ConsumerRebalanceListener listener) {
+        // 注册重平衡监听器
         registerRebalanceListener(listener);
+        // 设置订阅 Topic 模式， 这里设置的是 AUTO_TOPICS，表示按指定的 Topic 进行订阅，自动分配分区。
         setSubscriptionType(SubscriptionType.AUTO_TOPICS);
+        // 如果订阅的主题和以前订阅的一致，就不需要修改订阅信息。如果不一致，就需要修改
         return changeSubscription(topics);
     }
 
@@ -181,9 +200,11 @@ public class SubscriptionState {
     }
 
     private boolean changeSubscription(Set<String> topicsToSubscribe) {
+        //  如果订阅的主题和以前订阅的一致，就不需要修改订阅信息。
         if (subscription.equals(topicsToSubscribe))
             return false;
 
+        // 如果不一致，就需要修改
         subscription = topicsToSubscribe;
         return true;
     }
@@ -286,6 +307,7 @@ public class SubscriptionState {
     private void registerRebalanceListener(ConsumerRebalanceListener listener) {
         if (listener == null)
             throw new IllegalArgumentException("RebalanceListener cannot be null");
+        // 注册重平衡监听器
         this.rebalanceListener = listener;
     }
 

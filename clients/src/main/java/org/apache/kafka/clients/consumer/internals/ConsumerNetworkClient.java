@@ -212,6 +212,8 @@ public class ConsumerNetworkClient implements Closeable {
      */
     public boolean poll(RequestFuture<?> future, Timer timer) {
         do {
+            // ConsumerNetworkClient 会不断调用底层组件 NetworkClient
+            // 把 FindCoordinatorRequest 请求发送出去，直到发送成功或超时。
             poll(timer, future);
         } while (!future.isDone() && timer.notExpired());
         return future.isDone();
@@ -242,6 +244,7 @@ public class ConsumerNetworkClient implements Closeable {
      * @param pollCondition Nullable blocking condition
      * @param disableWakeup If TRUE disable triggering wake-ups
      */
+    // 轮询所有可以发送的请求，真正的发送。此时获取到每一个请求都绑定 SelectorKey.OP_WRITE 事件
     public void poll(Timer timer, PollCondition pollCondition, boolean disableWakeup) {
         // there may be handlers which need to be invoked if we woke up the previous call to poll
         firePendingCompletedRequests();
@@ -252,6 +255,7 @@ public class ConsumerNetworkClient implements Closeable {
             handlePendingDisconnects();
 
             // send all the requests we can send now
+            // 发送我们现在可以发送的所有请求
             long pollDelayMs = trySend(timer.currentTimeMs());
 
             // check whether the poll is still needed by the caller. Note that if the expected completion
@@ -282,6 +286,7 @@ public class ConsumerNetworkClient implements Closeable {
 
             // try again to send requests since buffer space may have been
             // cleared or a connect finished in the poll
+            // 再次发送我们现在可以发送的所有请求
             trySend(timer.currentTimeMs());
 
             // fail requests that couldn't be sent if they have expired
@@ -488,14 +493,20 @@ public class ConsumerNetworkClient implements Closeable {
         long pollDelayMs = maxPollTimeoutMs;
 
         // send any requests that can be sent now
+        // 遍历 Broker 节点
         for (Node node : unsent.nodes()) {
+            // 获取该节点的所有待发送的请求，存储在 unsent 队列中的请求
             Iterator<ClientRequest> iterator = unsent.requestIterator(node);
             if (iterator.hasNext())
+                // 计算最小过期时间
                 pollDelayMs = Math.min(pollDelayMs, client.pollDelayMs(node, now));
 
             while (iterator.hasNext()) {
                 ClientRequest request = iterator.next();
+                // 当客户端准备好后
                 if (client.ready(node, now)) {
+                    // 这里的 client 表示 NetworkClient，其中涉及到 Kafka 网络通讯的内容，
+                    // 可以查看之前的文章，会看到内部绑定 SelectionKey.OP_WRITE 事件
                     client.send(request, now);
                     iterator.remove();
                 } else {

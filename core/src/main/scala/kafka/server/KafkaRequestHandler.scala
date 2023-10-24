@@ -37,12 +37,12 @@ trait ApiRequestHandler {
 /**
  * A thread that answers kafka requests.
  */
-class KafkaRequestHandler(id: Int,
-                          brokerId: Int,
+class KafkaRequestHandler(id: Int,  // I/O线程序号
+                          brokerId: Int, // 所在Broker序号，即broker.id值
                           val aggregateIdleMeter: Meter,
-                          val totalHandlerThreads: AtomicInteger,
-                          val requestChannel: RequestChannel,
-                          apis: ApiRequestHandler,
+                          val totalHandlerThreads: AtomicInteger, // I/O线程池大小
+                          val requestChannel: RequestChannel, // 请求处理通道
+                          apis: ApiRequestHandler, // KafkaApis类，用于真正实现请求处理逻辑的类
                           time: Time) extends Runnable with Logging {
   this.logIdent = "[Kafka Request Handler " + id + " on Broker " + brokerId + "], "
   private val shutdownComplete = new CountDownLatch(1)

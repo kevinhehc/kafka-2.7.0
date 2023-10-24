@@ -17,5 +17,9 @@
 package org.apache.kafka.clients.consumer;
 
 public enum OffsetResetStrategy {
-    LATEST, EARLIEST, NONE
+    // 从分区最后位置消费。
+    LATEST,
+    // 从分区最一开始的位置消费。
+    EARLIEST,
+    NONE
 }

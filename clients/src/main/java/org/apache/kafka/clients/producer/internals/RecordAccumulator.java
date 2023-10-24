@@ -621,7 +621,7 @@ public final class RecordAccumulator {
         // 索引0的队列开始发送，可能会出现一直只发送前几个分区的消息的情况，造成其他分区饥饿。
         int start = drainIndex = drainIndex % parts.size();
         do {
-            // 3.获取partition的元数据
+            // 3.获取partition的元数据`
             PartitionInfo part = parts.get(drainIndex);
             TopicPartition tp = new TopicPartition(part.topic(), part.partition());
             this.drainIndex = (this.drainIndex + 1) % parts.size();

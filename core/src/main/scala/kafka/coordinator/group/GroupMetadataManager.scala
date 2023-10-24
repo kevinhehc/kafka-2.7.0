@@ -243,14 +243,18 @@ class GroupMetadataManager(brokerId: Int,
   def storeGroup(group: GroupMetadata,
                  groupAssignment: Map[String, Array[Byte]],
                  responseCallback: Errors => Unit): Unit = {
+    //读取分区数据,获取消息的结构版本
     getMagic(partitionFor(group.groupId)) match {
       case Some(magicValue) =>
         // We always use CREATE_TIME, like the producer. The conversion to LOG_APPEND_TIME (if necessary) happens automatically.
         val timestampType = TimestampType.CREATE_TIME
         val timestamp = time.milliseconds()
+        // 获取Group元信息的Key结构
         val key = GroupMetadataManager.groupMetadataKey(group.groupId)
+        // 获取Group元信息的Value结构
         val value = GroupMetadataManager.groupMetadataValue(group, groupAssignment, interBrokerProtocolVersion)
 
+        //构造消息体
         val records = {
           val buffer = ByteBuffer.allocate(AbstractRecords.estimateSizeInBytes(magicValue, compressionType,
             Seq(new SimpleRecord(timestamp, key, value)).asJava))
@@ -259,11 +263,13 @@ class GroupMetadataManager(brokerId: Int,
           builder.build()
         }
 
+        //构造TopicPartition，消息将会发往这个分区
         val groupMetadataPartition = new TopicPartition(Topic.GROUP_METADATA_TOPIC_NAME, partitionFor(group.groupId))
         val groupMetadataRecords = Map(groupMetadataPartition -> records)
         val generationId = group.generationId
 
         // set the callback function to insert the created group into cache after log append completed
+        //当日志写入成功之和调用这个回调函数，并将 创建的group插入缓存
         def putCacheCallback(responseStatus: Map[TopicPartition, PartitionResponse]): Unit = {
           // the append response should only contain the topics partition
           if (responseStatus.size != 1 || !responseStatus.contains(groupMetadataPartition))
@@ -312,6 +318,7 @@ class GroupMetadataManager(brokerId: Int,
 
           responseCallback(responseError)
         }
+        //将数据写入到Log中
         appendForGroup(group, groupMetadataRecords, putCacheCallback)
 
       case None =>

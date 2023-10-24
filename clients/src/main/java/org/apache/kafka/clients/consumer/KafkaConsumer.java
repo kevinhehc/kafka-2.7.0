@@ -668,7 +668,9 @@ public class KafkaConsumer<K, V> implements Consumer<K, V> {
             GroupRebalanceConfig groupRebalanceConfig = new GroupRebalanceConfig(config,
                     GroupRebalanceConfig.ProtocolType.CONSUMER);
 
+            // 获取消费组id
             this.groupId = Optional.ofNullable(groupRebalanceConfig.groupId);
+            // 获取消费者id
             this.clientId = config.getString(CommonClientConfigs.CLIENT_ID_CONFIG);
 
             LogContext logContext;
@@ -702,6 +704,7 @@ public class KafkaConsumer<K, V> implements Consumer<K, V> {
             List<ConsumerInterceptor<K, V>> interceptorList = (List) (new ConsumerConfig(userProvidedConfigs, false)).getConfiguredInstances(ConsumerConfig.INTERCEPTOR_CLASSES_CONFIG,
                     ConsumerInterceptor.class);
             this.interceptors = new ConsumerInterceptors<>(interceptorList);
+            // 设置key和value的反序列化类。
             if (keyDeserializer == null) {
                 this.keyDeserializer = config.getConfiguredInstance(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, Deserializer.class);
                 this.keyDeserializer.configure(config.originals(Collections.singletonMap(ConsumerConfig.CLIENT_ID_CONFIG, clientId)), true);
@@ -716,10 +719,13 @@ public class KafkaConsumer<K, V> implements Consumer<K, V> {
                 config.ignore(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG);
                 this.valueDeserializer = valueDeserializer;
             }
+            // 设置重启后消费策略。
             OffsetResetStrategy offsetResetStrategy = OffsetResetStrategy.valueOf(config.getString(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG).toUpperCase(Locale.ROOT));
+            // 初始化订阅状态。
             this.subscriptions = new SubscriptionState(logContext, offsetResetStrategy);
             ClusterResourceListeners clusterResourceListeners = configureClusterResourceListeners(keyDeserializer,
                     valueDeserializer, metrics.reporters(), interceptorList);
+            // 初始化消费者元数据
             this.metadata = new ConsumerMetadata(retryBackoffMs,
                     config.getLong(ConsumerConfig.METADATA_MAX_AGE_CONFIG),
                     !config.getBoolean(ConsumerConfig.EXCLUDE_INTERNAL_TOPICS_CONFIG),
@@ -738,6 +744,7 @@ public class KafkaConsumer<K, V> implements Consumer<K, V> {
             int heartbeatIntervalMs = config.getInt(ConsumerConfig.HEARTBEAT_INTERVAL_MS_CONFIG);
 
             ApiVersions apiVersions = new ApiVersions();
+            // 初始化底层通信模块
             NetworkClient netClient = new NetworkClient(
                     new Selector(config.getLong(ConsumerConfig.CONNECTIONS_MAX_IDLE_MS_CONFIG), metrics, time, metricGrpPrefix, channelBuilder, logContext),
                     this.metadata,
@@ -756,6 +763,7 @@ public class KafkaConsumer<K, V> implements Consumer<K, V> {
                     apiVersions,
                     throttleTimeSensor,
                     logContext);
+            // 初始化消费者通信模块
             this.client = new ConsumerNetworkClient(
                     logContext,
                     netClient,
@@ -768,6 +776,7 @@ public class KafkaConsumer<K, V> implements Consumer<K, V> {
             this.assignors = getAssignorInstances(config.getList(ConsumerConfig.PARTITION_ASSIGNMENT_STRATEGY_CONFIG), config.originals());
 
             // no coordinator will be constructed for the default (null) group id
+            // 初始化协调者模块
             this.coordinator = !groupId.isPresent() ? null :
                 new ConsumerCoordinator(groupRebalanceConfig,
                         logContext,
@@ -782,6 +791,7 @@ public class KafkaConsumer<K, V> implements Consumer<K, V> {
                         config.getInt(ConsumerConfig.AUTO_COMMIT_INTERVAL_MS_CONFIG),
                         this.interceptors,
                         config.getBoolean(ConsumerConfig.THROW_ON_FETCH_STABLE_OFFSET_UNSUPPORTED));
+            // 初始化获取消息的模块
             this.fetcher = new Fetcher<>(
                     logContext,
                     this.client,
@@ -1210,26 +1220,36 @@ public class KafkaConsumer<K, V> implements Consumer<K, V> {
      * @throws KafkaException if the rebalance callback throws exception
      */
     private ConsumerRecords<K, V> poll(final Timer timer, final boolean includeMetadataInTimeout) {
+        // 1、KafkaConsumer 是线程不安全的，同时只能一个线程运行，如果有多个线程同时调用 poll() 会抛出异常
         acquireAndEnsureOpen();
         try {
             this.kafkaConsumerMetrics.recordPollStart(timer.currentTimeMs());
 
+            // 2、消费者的订阅的主题不能为空，如果没有指定任何主题就抛异常。
             if (this.subscriptions.hasNoSubscriptionOrUserAssignment()) {
                 throw new IllegalStateException("Consumer is not subscribed to any topics or assigned any partitions");
             }
 
+            // 3、循环拉取消息，直到拉取到了消息或超时。
             do {
+                // 4、可以中断 consumer。
                 client.maybeTriggerWakeup();
 
+                // 5、判断 includeMetadataInTimeout 是 true 还是 false.
                 if (includeMetadataInTimeout) {
                     // try to update assignment metadata BUT do not need to block on the timer for join group
+                    // 6、如果为 true 则更新消费分区的任务元数据，协调器，心跳，消费位置。
                     updateAssignmentMetadataIfNeeded(timer, false);
                 } else {
+                    // 7、如果为 false 则更新消费分区的任务元数据，协调器，心跳，消费位置。
                     while (!updateAssignmentMetadataIfNeeded(time.timer(Long.MAX_VALUE), true)) {
                         log.warn("Still waiting for metadata");
                     }
                 }
 
+                // 7、开始拉取消息，不是真正从 broker 拉取消息，而是从缓存拉取消息。
+                // 这样设计是一个优化，如果从缓存拉取成功了，consumer 就提前发送下一次的拉取请求，
+                // 当你的应用在处理刚刚拉取的新纪录的时候，consumer 也同时在后台为你拉取好下一次要用的数据并放在缓存里。等待业务线程拉取。
                 final Map<TopicPartition, List<ConsumerRecord<K, V>>> records = pollForFetches(timer);
                 if (!records.isEmpty()) {
                     // before returning the fetched records, we can send off the next round of fetches
@@ -1242,6 +1262,7 @@ public class KafkaConsumer<K, V> implements Consumer<K, V> {
                         client.transmitSends();
                     }
 
+                    // 8、返回拦截器处理后的消息集合
                     return this.interceptors.onConsume(new ConsumerRecords<>(records));
                 }
             } while (timer.notExpired());
@@ -1265,16 +1286,19 @@ public class KafkaConsumer<K, V> implements Consumer<K, V> {
      * @throws KafkaException if the rebalance callback throws exception
      */
     private Map<TopicPartition, List<ConsumerRecord<K, V>>> pollForFetches(Timer timer) {
+        // 计算 poll 的等待时间
         long pollTimeout = coordinator == null ? timer.remainingMs() :
                 Math.min(coordinator.timeToNextPoll(timer.currentTimeMs()), timer.remainingMs());
 
         // if data is available already, return it immediately
+        // 1、首先调用 Fetcher#fetchedRecords() 从缓存中获取分区的消息的集合，如果不为空则直接返回
         final Map<TopicPartition, List<ConsumerRecord<K, V>>> records = fetcher.fetchedRecords();
         if (!records.isEmpty()) {
             return records;
         }
 
         // send any new fetches (won't resend pending fetches)
+        // 2、调用 Fetcher#sendFetches() 生成一个新的 Fetch 异步请求，准备拉取请求
         fetcher.sendFetches();
 
         // We do not want to be stuck blocking in poll if we are missing some positions
@@ -1282,6 +1306,9 @@ public class KafkaConsumer<K, V> implements Consumer<K, V> {
 
         // NOTE: the use of cachedSubscriptionHashAllFetchPositions means we MUST call
         // updateAssignmentMetadataIfNeeded before this method.
+        // 如果无法获取所有消费者订阅的分区的拉取位置并且 poll 的等待时间超过 retryBackoffMs，则将等待时间设置为 retryBackoffMs
+        // 注意：使用 cachedSubscriptionHashAllFetchPositions
+        // 意味着在调用此方法之前必须调用 updateAssignmentMetadataIfNeeded 方法
         if (!cachedSubscriptionHashAllFetchPositions && pollTimeout > retryBackoffMs) {
             pollTimeout = retryBackoffMs;
         }
@@ -1289,13 +1316,16 @@ public class KafkaConsumer<K, V> implements Consumer<K, V> {
         log.trace("Polling for fetches with timeout {}", pollTimeout);
 
         Timer pollTimer = time.timer(pollTimeout);
+        // 3、调用 ConsumerNetworkClient#poll() 发送拉取消息的请求，并将底层响应通过回调处理器传递到上层
         client.poll(pollTimer, () -> {
             // since a fetch might be completed by the background thread, we need this poll condition
             // to ensure that we do not block unnecessarily in poll()
+            // 因为获取消息可能被后台线程完成了，为了提升业务线程的效率，就不应该阻塞没有必要的poll()
             return !fetcher.hasAvailableFetches();
         });
         timer.update(pollTimer.currentTimeMs());
 
+        // 4、调用 Fetcher#fetchedRecords() 再次尝试从缓存中获取消息，返回消息记录
         return fetcher.fetchedRecords();
     }
 
@@ -2400,10 +2430,13 @@ public class KafkaConsumer<K, V> implements Consumer<K, V> {
      *             defined
      * @return true iff the operation completed without timing out
      */
+    // 初始化 ACK 偏移量
     private boolean updateFetchPositions(final Timer timer) {
         // If any partitions have been truncated due to a leader change, we need to validate the offsets
+        // 如果有任何分区由于leader更改而被截断，则需要验证它们的offset是否有效
         fetcher.validateOffsetsIfNeeded();
 
+        // 如果所有的分区都已经有了有效的位置，则返回true
         cachedSubscriptionHashAllFetchPositions = subscriptions.hasAllFetchPositions();
         if (cachedSubscriptionHashAllFetchPositions) return true;
 
@@ -2412,15 +2445,23 @@ public class KafkaConsumer<K, V> implements Consumer<K, V> {
         // coordinator lookup if there are partitions which have missing positions, so
         // a consumer with manually assigned partitions can avoid a coordinator dependence
         // by always ensuring that assigned partitions have an initial position.
+
+        // 如果存在没有有效位置且不在等待重置状态的分区，则需要拉取已提交的offsets
+        // 如果已分配的分区没有初始位置，则始终需要进行协调者查找以确保指定的分区有初始位置
         if (coordinator != null && !coordinator.refreshCommittedOffsetsIfNeeded(timer)) return false;
 
         // If there are partitions still needing a position and a reset policy is defined,
         // request reset using the default policy. If no reset strategy is defined and there
         // are partitions with a missing position, then we will raise an exception.
+
+        // 如果有分区仍然需要位置并且已定义重置策略，则使用默认策略请求重置
+        // 如果没有定义重置策略并且存在没有有效位置的分区，则会抛出异常
         subscriptions.resetInitializingPositions();
 
         // Finally send an asynchronous request to lookup and update the positions of any
         // partitions which are awaiting reset.
+
+        // 最后，异步请求查找和更新任何等待重置的分区的位置
         fetcher.resetOffsetsIfNeeded();
 
         return true;
@@ -2431,8 +2472,13 @@ public class KafkaConsumer<K, V> implements Consumer<K, V> {
      * @throws IllegalStateException If the consumer has been closed
      */
     private void acquireAndEnsureOpen() {
+        // 调用 acquire() 方法尝试获得轻量级锁
         acquire();
         if (this.closed) {
+            // 那么 currentThread 什么时候会变成默认值-1L呢？这个是由release()方法控制的，
+            // 当KafkaConsumer 内的方法结尾的时候都会调用 release()，这个方法首先把 refcount 减一，
+            // 然后判断 refcount 是否为零，为零说明现在的线程调用K afkaConsumer 内的方法都已经结束了，
+            // 就把 currentThread 设置为 NO_CURRENT_THREAD，这样其他线程才能获得 KafkaConsumer 的轻量级锁。
             release();
             throw new IllegalStateException("This consumer has already been closed.");
         }
@@ -2445,7 +2491,14 @@ public class KafkaConsumer<K, V> implements Consumer<K, V> {
      * @throws ConcurrentModificationException if another thread already has the lock
      */
     private void acquire() {
+        // 获取线程id
         long threadId = Thread.currentThread().getId();
+        // 这里判断是否抛出多线程访问的异常，同时满足下列两个条件才会抛出异常：
+        // 1)、判断线程 id 是否是当前线程 id，如果是那么 refcount 加一，表示当前线程又一次访问 poll()方法了。
+        //     refcount 表示当前线程重入轻量级锁的次数。
+        // 2)、尝试用 CAS 的方法把当前线程 id 赋值给 currentThread，如果赋值不成功就抛出异常。
+        //    CAS 的方法的初始值是 NO_CURRENT_THREAD 即默认值-1L，
+        //    也就是说如果 currentThread 已经是线程 id 了是不能赋值成功的。
         if (threadId != currentThread.get() && !currentThread.compareAndSet(NO_CURRENT_THREAD, threadId))
             throw new ConcurrentModificationException("KafkaConsumer is not safe for multi-threaded access");
         refcount.incrementAndGet();
