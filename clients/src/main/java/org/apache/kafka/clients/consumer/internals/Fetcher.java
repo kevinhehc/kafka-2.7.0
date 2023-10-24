@@ -739,6 +739,7 @@ public class Fetcher<K, V> implements Closeable {
                             completedFetch.lastEpoch,
                             position.currentLeader);
                     log.trace("Update fetching position to {} for partition {}", nextPosition, completedFetch.partition);
+                    // 提交的 offset 是根据拉取的最新的数据的 offset ， 而不是消费的 offset
                     subscriptions.position(completedFetch.partition, nextPosition);
                 }
 
